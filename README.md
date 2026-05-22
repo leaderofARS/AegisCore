@@ -14,17 +14,20 @@ The system is being built across 17 engineering levels — from raw socket I/O t
 
 ## Current Development Stage
 
-**Level 2.3 — Multithreading: Shared State & Sync** *(active)*
+**Level 2.4 — Thread Safety & Synchronization Hardening** *(active)*
 
 ```
-Level 0 ✅  Java Core Foundation
-Level 1 ✅  Raw Socket Networking
-Level 2 🔥  Multithreading (Level 2.3) ← YOU ARE HERE
-Level 3     Shared State & Sync
-Level 4     Server Architecture
-Level 5     Command Engine
+Level 0   ✅  Java Core Foundation
+Level 1   ✅  Raw Socket Networking
+Level 2.1 ✅  Basic Multithreading
+Level 2.2 ✅  Shared Client Registry
+Level 2.3 ✅  Broadcast Infrastructure
+Level 2.4 🔥  Synchronization Hardening ← YOU ARE HERE
+Level 2.5     Execution Architecture (Custom Thread Pools)
+Level 3       Command & Protocol Architecture
+Level 4       Server Architecture
 ...
-Level 17    AI + Analytics Layer
+Level 17      AI + Analytics Layer
 ```
 
 See [ROADMAP.md](./ROADMAP.md) for the complete engineering progression.

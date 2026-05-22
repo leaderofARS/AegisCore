@@ -12,6 +12,37 @@ Format:
 
 ---
 
+## [0.0.6] - 2026-05-22 — Level 2.4.1: Thread Safety & Synchronization Hardening
+
+### Added
+- `src/ServerStats.java` — New immutable telemetry snapshot class. All fields are `final`, giving JMM-safe cross-thread publication without any additional synchronization. Produced by `SharedClientRegistry.getStats()`.
+- `AtomicLong totalConnectionsAccepted` in `SharedClientRegistry` — monotonic lifetime connection counter. Incremented with a single CAS instruction per connection — zero lock overhead.
+- `AtomicLong totalMessagesRelayed` in `SharedClientRegistry` — counts total broadcast events dispatched since server start (one increment per `BroadcastMessage()` call).
+- `AtomicLong totalBytesSent` in `SharedClientRegistry` — accumulates approximate bytes written across all client streams. Useful for throughput profiling in Level 2.5.
+- `SharedClientRegistry.getStats()` — returns a `ServerStats` snapshot via atomic volatile reads. Safe to call from any thread at any time without locking.
+- `Logger.logRegistry()` and `Logger.logRegistryError()` — new log methods routing to `logs/Registry.log`, separating registry lifecycle events from server socket events.
+
+### Changed
+- **`ClientHandler.java` — Eliminated dual-writer output stream race condition.**
+  - Promoted `PrintWriter output` from a local variable to a class field, initialized once in `run()`.
+  - All writes (welcome message, ACKs, broadcast deliveries) now flow exclusively through the single `synchronized sendMessage()` method.
+  - Previously, `sendMessage()` created a new `PrintWriter(socket.getOutputStream())` on every call while `run()` held its own separate `PrintWriter` on the same stream — two writers on the same `OutputStream` with no coordinated locking. Under concurrent broadcast, this produced interleaved byte sequences and garbled client output. This is now fully eliminated.
+  - Added `output.checkError()` check after every write to surface broken connections that `PrintWriter` swallows silently.
+- **`SharedClientRegistry.java` — Replaced all `System.out.println()` with `Logger.logRegistry()`.**
+  - Raw `System.out.println()` calls under concurrent load produce interleaved, partially-written console lines. Routing through the synchronized Logger serializes all registry output.
+  - `BroadcastMessage()` now documents the weakly-consistent iterator contract, per-client lock acquisition pattern, and failure isolation behaviour.
+- **`Logger.java` — Fixed log filename typo and added registry log channel.**
+  - `CliendHandler.log` → `ClientHandler.log` (typo fixed).
+  - Added `logRegistry()` / `logRegistryError()` writing to `logs/Registry.log`.
+
+### Architecture Notes
+- **Fine-grained locking principle demonstrated:** `sendMessage()` holds only the intrinsic lock on a single `ClientHandler` instance. Broadcast writes to different clients proceed in parallel — only writes to the *same* client are serialized. No global lock is ever held during `BroadcastMessage()` iteration.
+- **Lock contention analysis:** The synchronized scope is exactly one `output.println()` call per client per message. This is the minimum viable critical section. Over-synchronization (locking the registry during broadcast) is explicitly avoided.
+- **`AtomicLong` vs `synchronized int`:** For high-frequency numeric counters, CAS-based atomics eliminate lock acquisition overhead entirely. Suitable for telemetry under thousands of concurrent events per second.
+- All changes retain the zero-external-dependency constraint (pure Java 21 standard library).
+
+---
+
 ## [0.0.5] - 2026-05-20 — Level 2.3: Logging Infrastructure & Concurrency Resilience
 
 ### Added

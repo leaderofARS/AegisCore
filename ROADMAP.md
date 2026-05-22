@@ -7,11 +7,16 @@
 ## Current Position
 
 | Level | Status |
-|-------|--------|
-| Level 0 — Java Core Foundation | ✅ Complete |
-| Level 1 — Raw Socket Networking | ✅ Complete (basic) |
-| Level 2 — Multithreading | 🔥 **CURRENT (Level 2.3 - Shared State)** |
-| Level 3 → 17 | ⏳ Upcoming |
+|---|---|
+| Level 0 — Java Core | ✅ Complete |
+| Level 1 — Raw Socket Networking | ✅ Complete |
+| Level 2.1 — Basic Multithreading | ✅ Complete |
+| Level 2.2 — Shared Client Registry | ✅ Complete |
+| Level 2.3 — Broadcast Infrastructure | ✅ Complete |
+| Level 2.4 — Synchronization Hardening | ✅ Complete |
+| Level 2.5 — Execution Architecture (Custom Thread Pools) | 🔥 **CURRENT** |
+| Level 3 — Command & Protocol Architecture | ⏳ Upcoming |
+| Level 4 → 17 | ⏳ Upcoming |
 
 ---
 
@@ -74,68 +79,96 @@ output.println();     // sends data to client
 
 ---
 
-### LEVEL 2 — Multithreading
-**Difficulty: 5/10** | **Status: 🔥 CURRENT**
+### LEVEL 2 — Multithreading & Shared Infrastructure
+**Difficulty: 5/10**
 
-**Goal:** Handle multiple simultaneous clients.
-
-**Building:**
-- One thread per client
-- Independent concurrent communication channels
-- Thread lifecycle management
-
-**Learning:**
-- `Thread`, `Runnable`
-- Thread lifecycle: NEW → RUNNABLE → BLOCKED → TERMINATED
-- `start()`, `run()`, `join()`, `sleep()`, `interrupt()`
-
-**Hidden Problems you will face:**
-| Problem | Description |
-|---------|-------------|
-| Thread explosion | Server spawns unlimited threads under heavy load |
-| Deadlocks | Two threads wait on each other forever |
-| Race conditions | Two threads corrupt the same object simultaneously |
-
-> **This is the first real barrier.** Most people completely collapse here — not because the code is hard, but because they don't understand what threads actually ARE.
+**Goal:** Evolve the raw TCP model into a high-concurrency real-time message exchange engine.
 
 ---
 
-### LEVEL 3 — Shared State & Synchronization
-**Difficulty: 6/10**
-
-**Goal:** Prevent data corruption across concurrent threads.
+#### LEVEL 2.1 — Basic Multithreading
+**Status:** ✅ Complete
 
 **Building:**
-- Shared client registry (list of all connected clients)
-- Global broadcast — send message from one client to ALL others
-- Thread-safe shared resource management
+- Dedicated `Thread`-based connection handlers (`ClientHandler.java`).
+- Independent, concurrent connection streams running parallel client sessions.
+- Graceful client termination via standard commands (e.g., `exit`).
 
 **Learning:**
-- `synchronized` keyword
-- `volatile` for memory visibility
-- `ReentrantLock`, `ReadWriteLock`
-- `ConcurrentHashMap`
-- `CopyOnWriteArrayList`
+- Thread creation, invocation lifecycle, and OS thread naming conventions.
+- Thread run isolation and independent socket I/O loops.
 
-**Problems You Will Face:**
+---
 
-```
-Race Condition:
-Two threads execute balance += 100 simultaneously.
-Both read balance=500, both write 600.
-Result: 600 instead of 700. Money lost.
+#### LEVEL 2.2 — Shared Client Registry
+**Status:** ✅ Complete
 
-ConcurrentModificationException:
-Thread A iterates client list.
-Thread B removes a client.
-Crash.
+**Building:**
+- A singleton-based global thread-safe user registry (`SharedClientRegistry.java`).
+- Core registry interfaces to safely add, track, query, and cleanly evict connections.
 
-Memory Visibility:
-Thread A writes a flag.
-Thread B never sees it because of CPU caching.
-```
+**Learning:**
+- Shared state hazard mitigation.
+- Non-blocking concurrent collection APIs.
 
-> **THIS LEVEL SEPARATES tutorial coders FROM backend engineers.** Every banking system, trading platform, and multiplayer game lives or dies here.
+---
+
+#### LEVEL 2.3 — Broadcast Infrastructure
+**Status:** ✅ Complete
+
+**Building:**
+- Global event-distribution loops spanning the entire concurrent client space.
+- Localized exception isolation inside iteration loops to shield active pipelines from single-consumer drops.
+- Automated system-level stress integration testing (`SystemIntegrationTest.java`).
+
+**Learning:**
+- Weakly-consistent iteration strategies (`ConcurrentHashMap.values()`).
+- Atomic unregistration lifecycles inside `finally` blocks to eliminate port/zombie leaks.
+
+---
+
+#### LEVEL 2.4 — Thread Safety & Synchronization Hardening
+**Difficulty: 6/10** | **Status: ✅ Complete**
+
+**Goal:** Intentionally harden the system against race conditions, thread contention, and stream corruptions under intense parallel traffic.
+
+**Building:**
+- **Safe Concurrent Broadcasting:** Eliminate race conditions between concurrent additions, removals, and loop iterations.
+- **Output Stream Serialization:** Enforce serialization on per-socket write pipelines (via synchronization or dedicated output queues) to prevent garbled, interleaved, or corrupted byte streams.
+- **Atomic State Management:** Integrate lock-free counters (`AtomicInteger`, `AtomicLong`) to collect high-frequency server stats with minimal thread contention.
+- **Fine-Grained Concurrency:** Minimize lock durations, replacing heavy lock bottlenecks with targeted thread coordination to retain high throughput.
+
+**Learning:**
+- Advanced thread-coordination, race-condition diagnostic tools, lock optimization, and synchronization mechanics.
+
+---
+
+#### LEVEL 2.5 — Execution Architecture & Thread Pools
+**Difficulty: 7/10** | **Status: 🔥 CURRENT**
+
+**Goal:** Abandon naive thread-per-client scaling and build a bounded, highly scalable worker-pool execution system.
+
+**Building:**
+- **Custom Worker Pool:** Before using Java's `ExecutorService`, design a custom Thread Pool from scratch using thread queues, worker loops, and standard coordination structures.
+- **Task Queue Architecture:** Model connection sockets as modular execution tasks managed via blocking concurrent queues.
+- **Worker Lifecycle & Scheduling:** Implement clean worker task scheduling, wakeups (`wait()` / `notify()`), and pool scaling constraints.
+- **Context-Switching Profiles:** Track, benchmark, and measure scheduler thrashing, context-switching latency, and memory footprint scaling.
+- **Heavy Load Testing:** Simulate 500+ parallel connections; profile throughput, latencies, CPU core thrashing, and heap consumption.
+
+**Learning:**
+- Producer-consumer patterns, queueing theory, fixed executor pools, and task scheduling design.
+
+---
+
+### LEVEL 3 — Command & Protocol Architecture
+**Difficulty: 8/10** | **Status: ⏳ Upcoming**
+
+**Goal:** Elevate the raw socket broadcaster into a fully structured, multi-tenant communication platform.
+
+**Building:**
+- Structured Protocol Framing (standard delimiters, payload framing, parsing, and routing).
+- Comprehensive Command Engine (processing `/login`, `/msg`, `/nick`, `/join`, etc.).
+- Multi-Tenant Isolation (named sessions, structured room channels, and private routing).
 
 ---
 
@@ -502,26 +535,30 @@ When idle → handle other connections
 ## Progress Tracker
 
 ```
-Level  0  [██████████] COMPLETE    Java Core Foundation
-Level  1  [██████████] COMPLETE    Raw Socket Networking
-Level  2  [████████░░] IN PROGRESS Multithreading (Level 2.3 - Shared State)
-Level  3  [░░░░░░░░░░] UPCOMING    Shared State & Sync
-Level  4  [░░░░░░░░░░] UPCOMING    Server Architecture
-Level  5  [░░░░░░░░░░] UPCOMING    Command Engine
-Level  6  [░░░░░░░░░░] UPCOMING    Thread Pools & Executors
-Level  7  [░░░░░░░░░░] UPCOMING    Database Integration
-Level  8  [░░░░░░░░░░] UPCOMING    Authentication & Security
-Level  9  [░░░░░░░░░░] UPCOMING    Event-Driven Architecture
-Level 10  [░░░░░░░░░░] UPCOMING    Real-Time Communication
-Level 11  [░░░░░░░░░░] UPCOMING    Non-Blocking I/O (NIO)
-Level 12  [░░░░░░░░░░] UPCOMING    Distributed Systems
-Level 13  [░░░░░░░░░░] UPCOMING    Fault Tolerance
-Level 14  [░░░░░░░░░░] UPCOMING    Microservices
-Level 15  [░░░░░░░░░░] UPCOMING    Cloud & DevOps
-Level 16  [░░░░░░░░░░] UPCOMING    High-Performance Infrastructure
-Level 17  [░░░░░░░░░░] UPCOMING    AI + Analytics Layer
+Level  0   [██████████] COMPLETE    Java Core Foundation
+Level  1   [██████████] COMPLETE    Raw Socket Networking
+Level  2.1 [██████████] COMPLETE    Basic Multithreading
+Level  2.2 [██████████] COMPLETE    Shared Client Registry
+Level  2.3 [██████████] COMPLETE    Broadcast Infrastructure
+Level  2.4 [██████████] COMPLETE    Synchronization Hardening
+Level  2.5 [█░░░░░░░░░] IN PROGRESS Execution Architecture (Custom Thread Pools) (🔥 Active)
+Level  3   [░░░░░░░░░░] UPCOMING    Command & Protocol Architecture
+Level  4   [░░░░░░░░░░] UPCOMING    Server Architecture
+Level  5   [░░░░░░░░░░] UPCOMING    Command Engine
+Level  6   [░░░░░░░░░░] UPCOMING    Thread Pools & Executors
+Level  7   [░░░░░░░░░░] UPCOMING    Database Integration
+Level  8   [░░░░░░░░░░] UPCOMING    Authentication & Security
+Level  9   [░░░░░░░░░░] UPCOMING    Event-Driven Architecture
+Level 10   [░░░░░░░░░░] UPCOMING    Real-Time Communication
+Level 11   [░░░░░░░░░░] UPCOMING    Non-Blocking I/O (NIO)
+Level 12   [░░░░░░░░░░] UPCOMING    Distributed Systems
+Level 13   [░░░░░░░░░░] UPCOMING    Fault Tolerance
+Level 14   [░░░░░░░░░░] UPCOMING    Microservices
+Level 15   [░░░░░░░░░░] UPCOMING    Cloud & DevOps
+Level 16   [░░░░░░░░░░] UPCOMING    High-Performance Infrastructure
+Level 17   [░░░░░░░░░░] UPCOMING    AI + Analytics Layer
 ```
 
 ---
 
-*Last updated: 2026-05-20 | Current Stage: Level 2.3 — Multithreading: Shared State & Sync*
+*Last updated: 2026-05-22 | Current Stage: Level 2.5 — Execution Architecture (Custom Thread Pools)*
