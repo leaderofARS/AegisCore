@@ -2,163 +2,123 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * SharedClientRegistry — Level 2.4: Synchronization Hardening
+ * Global singleton registry that tracks every live {@link ClientHandler} in the AegisCore server.
  *
- * Global singleton registry tracking every currently connected client.
- * Provides thread-safe client registration, lookup, removal, and broadcast.
- * Adds lock-free atomic telemetry counters for server observability.
+ * <p>This class is the central bookkeeping authority for all active client connections. Every
+ * component that needs to look up, enumerate, or broadcast to connected clients goes through this
+ * registry. It also maintains lifetime server-wide statistics (total connections accepted, messages
+ * relayed, and bytes sent) that are surfaced via {@link #getStats()}.
  *
- * ─────────────────────────────────────────────────────────────────────────────
- * THREAD SAFETY ARCHITECTURE
- * ─────────────────────────────────────────────────────────────────────────────
+ * <h3>Singleton guarantee</h3>
+ * The sole instance is created eagerly as a {@code static final} field. The JVM's class-loading
+ * mechanism guarantees that the field is initialised exactly once and that the fully-constructed
+ * object is visible to every thread before any code can call {@link #getInstance()}.  No
+ * double-checked locking or {@code volatile} flag is needed.
  *
- *   THREE concurrent operations can hit this class simultaneously:
- *     1. addClient()       — a new connection is accepted (server accept-loop thread)
- *     2. removeClient()    — a client disconnects    (that client's handler thread)
- *     3. BroadcastMessage()— a client sends a message (any client's handler thread)
+ * <h3>Thread safety</h3>
+ * <ul>
+ *   <li>The client map is a {@link ConcurrentHashMap}; concurrent {@code put}, {@code remove}, and
+ *       iteration are all safe without an external lock.
+ *   <li>The three numeric accumulators are {@link AtomicLong} fields, allowing lock-free CAS
+ *       increments that are far cheaper than {@code synchronized} blocks under high concurrency.
+ *   <li>{@link #BroadcastMessage(String)} iterates over the map's weakly-consistent view — it will
+ *       never throw {@link java.util.ConcurrentModificationException} and dead entries self-evict
+ *       asynchronously via {@code ClientHandler.forceDisconnect()}.
+ * </ul>
  *
- *   Strategy: ConcurrentHashMap handles structural concurrency (add/remove/iterate)
- *   without any external synchronization. Each individual operation on the map
- *   is atomic. The weakly-consistent iterator used in BroadcastMessage() is
- *   intentional and correct — see BroadcastMessage() javadoc for the reasoning.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * WHY NOT SYNCHRONIZE THE ENTIRE REGISTRY?
- * ─────────────────────────────────────────────────────────────────────────────
- *
- *   A naive approach wraps every method in synchronized(this):
- *
- *       synchronized void addClient(...)    { map.put(...);   }
- *       synchronized void removeClient(...) { map.remove(...); }
- *       synchronized void BroadcastMessage(...) {
- *           for (handler : map.values()) handler.sendMessage(msg);
- *       }
- *
- *   The moment BroadcastMessage() holds the global lock while iterating,
- *   NO client can connect or disconnect until the broadcast finishes.
- *   Under 100 clients, a broadcast calls sendMessage() 100 times. Each
- *   sendMessage() may block waiting for a slow client's network buffer.
- *   The entire server stalls for the duration. Throughput collapses.
- *
- *   ConcurrentHashMap + per-client locks (in ClientHandler.sendMessage())
- *   eliminates this bottleneck entirely — see BroadcastMessage() for detail.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * ATOMIC COUNTERS — WHY AtomicLong, NOT synchronized int
- * ─────────────────────────────────────────────────────────────────────────────
- *
- *   For simple numeric accumulators (totalConnections++, totalMessages++) the
- *   cost of acquiring a monitor lock is disproportionate. AtomicLong uses
- *   CPU-level Compare-And-Swap (CAS) instructions — hardware-atomic, no OS
- *   context switch, effectively zero contention overhead at normal concurrency.
- *
- *   Rule of thumb:
- *     • Shared numeric counter  → AtomicLong / AtomicInteger
- *     • Shared complex state    → synchronized block or ReentrantLock
+ * <p>This class is unconditionally thread-safe.
  */
 public class SharedClientRegistry
 {
-    // ─────────────────────────────────────────────────────────────────────────
+    // -------------------------------------------------------------------------
     // SINGLETON
-    // ─────────────────────────────────────────────────────────────────────────
+    // -------------------------------------------------------------------------
 
     /**
-     * Eagerly initialized singleton.
+     * The sole instance of this registry.
      *
-     * The JVM class-loading specification guarantees that static final fields
-     * are initialized exactly once, and that initialization is visible to all
-     * threads before any thread can access the class. No synchronized needed.
+     * <p>Eagerly initialised by the class loader; safe for publication to any thread without
+     * additional synchronisation.
      */
     private static final SharedClientRegistry instance = new SharedClientRegistry();
 
-    /** Private constructor — prevents external instantiation. */
+    /** Private constructor — prevents external or subclass instantiation. */
     private SharedClientRegistry() {}
 
-    public static SharedClientRegistry getInstance() {
-        return instance;
-    }
+    /**
+     * Returns the single, process-wide {@code SharedClientRegistry} instance.
+     *
+     * @return the singleton registry; never {@code null}
+     */
+    public static SharedClientRegistry getInstance() { return instance; }
 
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // CONNECTED CLIENT MAP
-    // ─────────────────────────────────────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // STATE
+    // -------------------------------------------------------------------------
 
     /**
-     * Maps clientId → ClientHandler for every currently active connection.
+     * Map from client-ID strings to their active {@link ClientHandler} objects.
      *
-     * ConcurrentHashMap vs HashMap:
-     *   HashMap is NOT thread-safe. Under concurrent access it can:
-     *     - Return stale or null values for existing keys.
-     *     - Enter an infinite loop during rehashing (Java 6 bug, still possible).
-     *     - Cause data loss silently.
-     *
-     *   ConcurrentHashMap uses internal segment locking (Java 8+: CAS + bin locks)
-     *   to allow concurrent reads and writes without a global lock.
-     *   put(), remove(), get(), size(), and values() are all safe to call
-     *   from multiple threads simultaneously.
+     * <p>{@link ConcurrentHashMap} was chosen because it allows concurrent {@code put},
+     * {@code remove}, and full-map iteration without holding a single global lock.  Internally it
+     * uses CAS operations and fine-grained bin-level locking (Java 8+), making it the right
+     * trade-off for a chat server where connections arrive and depart continuously while broadcast
+     * iteration is also in progress.
      */
     private final ConcurrentHashMap<String, ClientHandler> connectedClients
             = new ConcurrentHashMap<>();
 
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // ATOMIC TELEMETRY COUNTERS
-    // ─────────────────────────────────────────────────────────────────────────
-
     /**
-     * Total client connections accepted since server start.
+     * Monotonically increasing count of every connection ever accepted by this server process.
      *
-     * Monotonic — only incremented, never decremented.
-     * Gives a cumulative view of server load independent of current active count.
-     *
-     * AtomicLong.incrementAndGet() is a single hardware CAS instruction.
-     * No lock acquisition, no thread scheduling, no OS involvement.
+     * <p>{@link AtomicLong} enables lock-free increment via a single CAS instruction, which is
+     * vastly cheaper than a {@code synchronized} block when many threads are accepting connections
+     * simultaneously.  The value never decreases; disconnections do not decrement it.
      */
     private final AtomicLong totalConnectionsAccepted = new AtomicLong(0);
 
     /**
-     * Total broadcast events dispatched since server start.
+     * Running total of broadcast operations dispatched since server start.
      *
-     * Incremented ONCE per BroadcastMessage() call — not once per recipient.
-     * Counts "how many times a message was sent into the system," not deliveries.
-     * Deliveries = totalMessagesRelayed × average recipient count (derivable).
+     * <p>Incremented once per {@link #BroadcastMessage(String)} call regardless of how many
+     * clients actually received the message.  {@link AtomicLong} for the same lock-free reasons as
+     * {@link #totalConnectionsAccepted}.
      */
     private final AtomicLong totalMessagesRelayed = new AtomicLong(0);
 
     /**
-     * Approximate total bytes written to all client output streams since start.
+     * Cumulative byte-count of data confirmed delivered to active clients.
      *
-     * Approximation: uses message.getBytes().length × recipient count.
-     * True byte count would require tracking PrintWriter flush bytes directly.
-     * This approximation is sufficient for throughput profiling and benchmarking.
-     *
-     * addAndGet() is also a single CAS instruction — safe for high-frequency use.
+     * <p>Only bytes sent to clients whose {@link ClientHandler#isActive()} flag is {@code true}
+     * immediately after {@link ClientHandler#sendMessage(String)} returns are counted here.
+     * Attempted-but-failed sends are not included, so this figure represents confirmed throughput.
+     * {@link AtomicLong} allows concurrent {@link AtomicLong#addAndGet(long)} calls from parallel
+     * broadcast threads without a lock.
      */
     private final AtomicLong totalBytesSent = new AtomicLong(0);
 
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // REGISTRY OPERATIONS
-    // ─────────────────────────────────────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // CONNECTION LIFECYCLE
+    // -------------------------------------------------------------------------
 
     /**
-     * Registers a newly connected client in the shared map.
+     * Registers a newly connected client in the registry and updates lifetime statistics.
      *
-     * Thread safety:
-     *   ConcurrentHashMap.put() is internally atomic — no external lock needed.
-     *   AtomicLong.incrementAndGet() is a single CAS instruction.
-     *   Logger.logRegistry() is synchronized internally (see Logger).
+     * <p>The {@code clientId} is used as the map key for all subsequent lookups and removals.
+     * After insertion the method logs both the new client's identity and a snapshot of current
+     * active / total-ever counts.
      *
-     * @param clientId  Unique identifier string for the client (IP:port).
-     * @param handler   The ClientHandler instance managing that client's session.
+     * @param clientId a non-null, non-empty string uniquely identifying the client for the lifetime
+     *                 of this connection (e.g., an assigned UUID or IP:port string)
+     * @param handler  the non-null {@link ClientHandler} that owns the client's socket and I/O
+     *                 threads
      */
     public void addClient(String clientId, ClientHandler handler)
     {
-        // Register the client in the concurrent map — thread-safe, no lock needed.
         connectedClients.put(clientId, handler);
 
-        // Increment the lifetime connection counter atomically.
-        // incrementAndGet() returns the new value — useful for logging.
+        // Atomically increment and capture the new lifetime total so the log line is consistent
+        // with the value stored in totalConnectionsAccepted.
         long totalEver = totalConnectionsAccepted.incrementAndGet();
 
         Logger.logRegistry("Client connected: " + clientId);
@@ -169,32 +129,39 @@ public class SharedClientRegistry
     }
 
     /**
-     * Unregisters a disconnected or exiting client from the shared map.
+     * Removes a client from the registry upon disconnection.
      *
-     * Called from ClientHandler.cleanup() inside a finally block — this method
-     * is guaranteed to execute even when the client disconnects abruptly.
+     * <p>If {@code clientId} is not currently in the map (e.g., it was already evicted by a
+     * concurrent broadcast) this method is a safe no-op — {@link ConcurrentHashMap#remove} is
+     * idempotent.  After removal the method logs the departed client's identity and a fresh
+     * active-count snapshot.
      *
-     * Thread safety: ConcurrentHashMap.remove() is internally atomic.
-     *
-     * @param clientId  The ID of the client to remove.
+     * @param clientId the non-null identifier of the client to deregister; must match the value
+     *                 passed to {@link #addClient(String, ClientHandler)} at connect time
      */
     public void removeClient(String clientId)
     {
-        // Remove the client atomically — ConcurrentHashMap handles concurrency.
         connectedClients.remove(clientId);
 
         Logger.logRegistry("Client disconnected: " + clientId);
         Logger.logRegistry(
             "Active: " + getClientCount() +
+            // Read lifetime total without incrementing — disconnection does not change it.
             " | Total ever connected: " + totalConnectionsAccepted.get()
         );
     }
 
+    // -------------------------------------------------------------------------
+    // LOOKUP & INSPECTION
+    // -------------------------------------------------------------------------
+
     /**
-     * Retrieves the handler for a specific client by their ID.
+     * Returns the {@link ClientHandler} associated with the given client ID, or {@code null} if no
+     * such client is currently registered.
      *
-     * @param clientId  The client ID to look up.
-     * @return          The ClientHandler, or null if that client is not connected.
+     * @param clientId the non-null identifier of the client to look up
+     * @return the live {@link ClientHandler} for {@code clientId}, or {@code null} if the client
+     *         is not connected
      */
     public ClientHandler getClient(String clientId)
     {
@@ -202,114 +169,128 @@ public class SharedClientRegistry
     }
 
     /**
-     * Returns the number of currently active client connections.
+     * Returns the number of clients currently registered in the map.
      *
-     * ConcurrentHashMap.size() is a live, consistent read of the current count.
-     * Note: this is a snapshot — by the time the caller reads the value,
-     * a client may have connected or disconnected. Acceptable for telemetry.
+     * <p>Because {@link ConcurrentHashMap#size()} is not guaranteed to be perfectly consistent
+     * with concurrent modifications, the returned value is a best-effort snapshot.  It is suitable
+     * for logging and statistics but should not be used for coordinating critical-section access.
+     *
+     * @return the approximate number of active client connections; never negative
      */
     public int getClientCount()
     {
         return connectedClients.size();
     }
 
-    /** Logs all currently connected client IDs to the registry log. */
+    /**
+     * Logs the set of client IDs that are currently registered.
+     *
+     * <p>Uses the map's {@code keySet()} view, which reflects the state at the moment the log
+     * line is formatted.  Intended for administrative / debugging output only.
+     */
     public void showConnectedClients()
     {
         Logger.logRegistry("Currently connected clients: " + connectedClients.keySet());
     }
 
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // BROADCAST — FINE-GRAINED LOCKING IN ACTION
-    // ─────────────────────────────────────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // BROADCAST
+    // -------------------------------------------------------------------------
 
     /**
-     * Distributes a message to every currently connected client.
+     * Delivers {@code message} to every client currently in the registry and updates byte / relay
+     * statistics.
      *
-     * ── WHAT FINE-GRAINED LOCKING MEANS HERE ────────────────────────────────
+     * <p>The method iterates over {@link ConcurrentHashMap}'s weakly-consistent view of values.
+     * This means:
+     * <ul>
+     *   <li>Iteration never throws {@link java.util.ConcurrentModificationException}.
+     *   <li>Clients that connect or disconnect during the loop may or may not be included —
+     *       that is acceptable; dead handlers self-evict via {@code forceDisconnect()}.
+     * </ul>
      *
-     *   This method holds NO global lock at any point during its execution.
+     * <p>For each client, the method calls {@link ClientHandler#sendMessage(String)} and then
+     * reads the handler's {@link ClientHandler#isActive()} flag — a volatile read, requiring no
+     * lock — to decide whether the send actually reached the client.  Only confirmed deliveries
+     * contribute to {@link #totalBytesSent}.
      *
-     *   The iteration over connectedClients.values() is weakly-consistent:
-     *     - Clients added during iteration MAY or MAY NOT receive this message
-     *       (depends on whether they are added before or after their slot is visited).
-     *     - Clients removed during iteration are either skipped entirely, or their
-     *       sendMessage() call hits the "socket.isClosed()" guard and no-ops safely.
-     *   This is the correct trade-off for broadcast: no frozen snapshot needed.
+     * <p>If any individual send throws an unchecked exception the error is logged and iteration
+     * continues so that one bad client cannot block all others from receiving the message.
      *
-     *   Each handler.sendMessage() call acquires only THAT client's intrinsic lock:
-     *
-     *       Thread A (broadcasting) → acquires Client X's lock → writes → releases
-     *       Thread B (broadcasting) → acquires Client Y's lock → writes → releases
-     *       ↑ These happen in parallel. No mutual exclusion between different clients.
-     *
-     *   Only writes to the SAME client are serialized.
-     *   That is fine-grained locking. That is why throughput scales.
-     *
-     * ── FAILURE ISOLATION ────────────────────────────────────────────────────
-     *
-     *   If one client has a broken connection, sendMessage() on that handler
-     *   logs the error but does NOT throw. The broadcast continues to all
-     *   remaining healthy clients uninterrupted.
-     *
-     * @param message  The message string to send to all connected clients.
+     * @param message the non-null text payload to relay to all connected clients; its UTF-8
+     *                byte-length is used for byte-count accounting
      */
     public void BroadcastMessage(String message)
     {
-        // Increment the broadcast event counter atomically — one CAS instruction.
+        // Count every broadcast attempt, regardless of how many clients succeed.
         totalMessagesRelayed.incrementAndGet();
 
-        // Pre-compute the byte length once — reused for each recipient.
-        // message.getBytes() defaults to platform encoding; consistent for telemetry.
+        // Compute byte-length once so every successful delivery can addAndGet without re-encoding.
         int messageBytes = message.getBytes().length;
 
-        // Iterate all currently known handlers.
-        // weakly-consistent: safe under concurrent map modifications.
+        int attempted  = 0;
+        int successful = 0;
+
         for (ClientHandler handler : connectedClients.values())
         {
+            attempted++;
             try {
-                // ── PER-CLIENT LOCK ──────────────────────────────────────────
-                // sendMessage() is synchronized on the handler instance ("this").
-                // This acquires ONLY that specific client's lock.
-                // Other clients' broadcasts continue unblocked in parallel.
                 handler.sendMessage(message);
 
-                // Accumulate approximate bytes written across all streams.
-                // addAndGet() is a single CAS — no lock needed.
-                totalBytesSent.addAndGet(messageBytes);
+                // isActive() is a volatile read on the ClientHandler — no lock needed.
+                // A false return means sendMessage() triggered forceDisconnect() internally,
+                // so the bytes never reached the client's socket buffer.
+                if (handler.isActive()) {
+                    totalBytesSent.addAndGet(messageBytes);
+                    successful++;
+                } else {
+                    Logger.logRegistryError(
+                        "[BROADCAST] Dead client evicted mid-broadcast: " +
+                        handler.getClientId() + " — message not delivered."
+                    );
+                }
 
             } catch (Exception e) {
-                // Isolate: one broken client cannot abort the entire broadcast loop.
+                // Swallow per-client exceptions so one misbehaving handler cannot prevent the
+                // remaining clients from receiving the broadcast.
                 Logger.logRegistryError(
-                    "Broadcast delivery failed for a client: " + e.getMessage()
+                    "[BROADCAST] Unexpected failure for client " +
+                    handler.getClientId() + ": " + e.getMessage()
                 );
             }
         }
+
+        // Warn operators whenever the broadcast was not fully delivered so they can investigate
+        // dead connections that have not yet self-evicted.
+        if (successful < attempted) {
+            Logger.logRegistryError(
+                "[BROADCAST] Partial delivery: " + successful + "/" + attempted +
+                " clients received the message."
+            );
+        }
     }
 
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // SERVER STATS SNAPSHOT
-    // ─────────────────────────────────────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // STATISTICS
+    // -------------------------------------------------------------------------
 
     /**
-     * Returns an immutable snapshot of current server telemetry.
+     * Returns a consistent point-in-time snapshot of server-wide statistics.
      *
-     * AtomicLong.get() is a volatile read — guaranteed to return the latest
-     * committed value without acquiring any lock. Safe to call from any thread.
+     * <p>Each field is read from its respective {@link AtomicLong} in a single load instruction.
+     * The returned {@link ServerStats} object is immutable; callers may hold references to it
+     * without affecting the live counters.
      *
-     * Returns a ServerStats object (immutable value type) — see ServerStats.java.
-     *
-     * @return  A point-in-time snapshot of server metrics.
+     * @return a non-null {@link ServerStats} value object capturing the current values of
+     *         total connections accepted, active connections, messages relayed, and bytes sent
      */
     public ServerStats getStats()
     {
         return new ServerStats(
-            totalConnectionsAccepted.get(),  // long — atomic volatile read
-            getClientCount(),                // int  — ConcurrentHashMap.size()
-            totalMessagesRelayed.get(),      // long — atomic volatile read
-            totalBytesSent.get()             // long — atomic volatile read
+            totalConnectionsAccepted.get(),
+            getClientCount(),
+            totalMessagesRelayed.get(),
+            totalBytesSent.get()
         );
     }
 }

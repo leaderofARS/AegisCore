@@ -3,197 +3,242 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 
 /**
- * Logger — Level 2.4: Synchronization Hardening
+ * Centralised, file-backed logging utility for the AegisCore multi-threaded system.
  *
- * Thread-safe centralized logging system.
- * Writes timestamped entries to both the console and component-specific log files
- * stored in the /logs directory.
+ * <p>This class is a pure static utility: it holds no per-instance state and cannot be
+ * instantiated. Every component in the system (server, client-handler, registry, client)
+ * owns a dedicated log file so that log streams can be read and redirected independently
+ * without interleaving noise from other subsystems.
  *
- * ─────────────────────────────────────────────────────────────────────────────
- * THREAD SAFETY
- * ─────────────────────────────────────────────────────────────────────────────
+ * <p><b>Thread safety:</b> The private {@link #writeToFile} method is {@code static
+ * synchronized}, which acquires the {@code Logger} <em>class-object monitor</em> before
+ * performing any I/O. This is a deliberate coarse global lock: log writes are infrequent,
+ * and strict ordering across all files is worth more than the marginal throughput gain of
+ * per-file locking. All public entry points delegate to {@code writeToFile}, so they
+ * inherit the same guarantee.
  *
- *   writeToFile() is the single write path. It is synchronized on the Logger
- *   CLASS object (static synchronized method). This means only ONE thread
- *   can write a log entry at a time — across ALL log files.
+ * <p><b>Output routing:</b>
+ * <ul>
+ *   <li>{@code INFO}  entries are written to {@link System#out} (white / default terminal colour).
+ *   <li>{@code ERROR} entries are written to {@link System#err} (red in most terminals; can be
+ *       separated from normal output when stdout and stderr are redirected to different sinks).
+ * </ul>
  *
- *   This is intentionally a coarse global lock: log writes are infrequent
- *   relative to business logic, and correct ordering of log output is more
- *   valuable than marginal throughput gains from per-file locking.
+ * <p><b>Log files (all under {@code logs/}):</b>
+ * <pre>
+ *   logs/Server.log
+ *   logs/ClientHandler.log
+ *   logs/Registry.log
+ *   logs/ClientID.log
+ * </pre>
  *
- *   If log throughput becomes a bottleneck at high concurrency, the fix is
- *   a dedicated logging thread with a BlockingQueue — that is a Level 2.5+
- *   concern and will be addressed when stress profiling demands it.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * LOG FILES
- * ─────────────────────────────────────────────────────────────────────────────
- *
- *   logs/Server.log          — server socket lifecycle events
- *   logs/ClientHandler.log   — per-client message events and thread states
- *   logs/Registry.log        — client registration and deregistration events (NEW 2.4)
- *   logs/ClientID.log        — client-side diagnostic output
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * LEVEL 2.4 ADDITION
- * ─────────────────────────────────────────────────────────────────────────────
- *
- *   Added logRegistry() and logRegistryError() — routes SharedClientRegistry
- *   output through this synchronized Logger instead of raw System.out.println().
- *
- *   WHY THIS MATTERS:
- *     Registry events (connect/disconnect) were previously written with
- *     System.out.println() directly. Under concurrent load, multiple threads
- *     calling println() simultaneously produce interleaved console lines:
- *
- *         [INFO] Client [INFO] disconnected: /127.0.0.1:5432connected: /127.0.0.1:5433
- *
- *     Routing through the synchronized Logger serializes all console output
- *     and guarantees each log entry appears as one complete, intact line.
+ * <p><b>Design pattern:</b> Static utility class (non-instantiable). The {@code logs/}
+ * directory is created exactly once at class-load time via a {@code static} initialiser.
  */
-public class Logger
-{
-    // ─────────────────────────────────────────────────────────────────────────
-    // CONFIGURATION
-    // ─────────────────────────────────────────────────────────────────────────
+public class Logger {
 
-    /** Directory where all log files are written. Relative to working directory. */
+    // -------------------------------------------------------------------------
+    // CONSTANTS
+    // -------------------------------------------------------------------------
+
+    /**
+     * Relative path to the directory that holds all log files.
+     *
+     * <p>Using a relative path anchors the logs directory to the JVM working directory,
+     * keeping the layout self-contained and portable across environments.
+     */
     private static final String LOG_DIR = "logs";
 
-    /** Timestamp format used in every log entry. Millisecond precision for debugging. */
+    /**
+     * Timestamp formatter shared by every log entry.
+     *
+     * <p>{@link DateTimeFormatter} instances are immutable and thread-safe after
+     * construction, so a single static constant is safe to reuse across concurrent callers.
+     * The millisecond field ({@code .SSS}) gives enough resolution to distinguish rapid
+     * successive events without the overhead of nanosecond precision.
+     */
     private static final DateTimeFormatter FORMATTER =
-        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
 
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // STATIC INITIALIZER — create log directory on first class load
-    // ─────────────────────────────────────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // STATIC INITIALISER — directory bootstrap
+    // -------------------------------------------------------------------------
 
     static {
-        // Runs once when the Logger class is first loaded by the JVM.
-        // Creates the logs/ directory if it does not already exist.
-        // mkdirs() creates the full path including parent directories.
         File dir = new File(LOG_DIR);
         if (!dir.exists()) {
+            // mkdirs() creates the full ancestor chain in one call, so the logs/
+            // directory will be created even if intermediate parent directories are
+            // also missing (e.g. in a freshly unpacked distribution).
             dir.mkdirs();
         }
     }
 
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // CORE WRITE METHOD — THE SYNCHRONIZED CRITICAL SECTION
-    // ─────────────────────────────────────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // CORE WRITE PRIMITIVE
+    // -------------------------------------------------------------------------
 
     /**
-     * Writes a timestamped log entry to the console and to a specific log file.
+     * Formats and persists a single log entry to the named file, then echoes it to the
+     * appropriate standard stream.
      *
-     * SYNCHRONIZATION:
-     *   "static synchronized" acquires the monitor on the Logger CLASS object
-     *   (not an instance). This is a class-level lock — effectively a global
-     *   lock for all Logger calls. Only one thread can write a log entry at a time.
+     * <p>The entry format is:
+     * <pre>
+     *   [yyyy-MM-dd HH:mm:ss.SSS] [LEVEL] message
+     * </pre>
      *
-     *   This prevents console output interleaving across concurrent threads and
-     *   ensures each line in the log file is a complete, intact entry.
+     * <p>The method is {@code static synchronized}: it holds the {@code Logger}
+     * class-object monitor for the duration of the call so that concurrent threads
+     * cannot interleave partial log entries in the same file.
      *
-     * @param filename  Name of the log file within LOG_DIR (e.g., "Server.log").
-     * @param level     Log level label: "INFO" or "ERROR".
-     * @param message   The message body to record.
+     * <p>The {@link PrintWriter} is opened in <em>append</em> mode and wrapped in a
+     * try-with-resources block, which guarantees the underlying buffer is flushed and the
+     * file descriptor released even when an exception is thrown mid-write.
+     *
+     * <p>If the write itself fails (e.g. disk full, permission denied), the error is
+     * reported directly to {@link System#err}. Falling back to console output rather than
+     * re-invoking {@code writeToFile} avoids infinite recursion while still surfacing the
+     * failure.
+     *
+     * @param filename the bare filename (no path) of the target log file within
+     *                 {@value #LOG_DIR}; must not be {@code null}
+     * @param level    the severity label to embed in the entry, e.g. {@code "INFO"} or
+     *                 {@code "ERROR"}; must not be {@code null}
+     * @param message  the human-readable log message; must not be {@code null}
      */
-    private static synchronized void writeToFile(String filename, String level, String message)
-    {
-        // Build the complete log entry string with timestamp and level prefix.
+    private static synchronized void writeToFile(String filename, String level, String message) {
         String timestamp = LocalDateTime.now().format(FORMATTER);
         String logEntry  = String.format("[%s] [%s] %s", timestamp, level, message);
 
-        // ── CONSOLE OUTPUT ───────────────────────────────────────────────────
-        // ERROR goes to stderr (System.err) so it appears in red in most terminals
-        // and can be separated from normal stdout in piped/redirected outputs.
+        // Route to the correct standard stream so that ERROR entries appear in red on
+        // ANSI-capable terminals and can be captured separately when stdout/stderr are
+        // redirected to different sinks (e.g. server.log vs server.err in systemd).
         if ("ERROR".equals(level)) {
             System.err.println(logEntry);
         } else {
             System.out.println(logEntry);
         }
 
-        // ── FILE OUTPUT ──────────────────────────────────────────────────────
-        // Opens the file in APPEND mode (second arg = true).
-        // try-with-resources guarantees the PrintWriter is closed even on exception,
-        // which flushes the buffer and releases the file descriptor.
         File file = new File(LOG_DIR, filename);
+        // Append mode (second argument = true) preserves all prior entries across JVM
+        // restarts. try-with-resources ensures flush + close even if println() throws.
         try (PrintWriter writer = new PrintWriter(new FileWriter(file, true))) {
             writer.println(logEntry);
         } catch (IOException e) {
-            // Cannot use Logger here (would recurse). Fall back to stderr directly.
+            // Do NOT call writeToFile() here — that would recurse infinitely if the disk
+            // or filesystem is in a bad state.  Printing directly to System.err is the
+            // safest fallback that is guaranteed not to involve file I/O.
             System.err.println("[ERROR] Failed to write to log file " + filename + ": " + e.getMessage());
         }
     }
 
+    // -------------------------------------------------------------------------
+    // SERVER LOGGING
+    // -------------------------------------------------------------------------
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // SERVER LOG METHODS — logs/Server.log
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /** Logs an INFO-level event from the server accept loop to logs/Server.log. */
+    /**
+     * Logs an informational message to the server log file ({@code logs/Server.log}).
+     *
+     * <p>Use this method for normal server lifecycle events such as start-up, shutdown,
+     * and accepted connections.
+     *
+     * @param message the informational message to record; must not be {@code null}
+     */
     public static void logServer(String message) {
         writeToFile("Server.log", "INFO", message);
     }
 
-    /** Logs an ERROR-level event from the server accept loop to logs/Server.log. */
+    /**
+     * Logs an error message to the server log file ({@code logs/Server.log}).
+     *
+     * <p>The entry is also echoed to {@link System#err}, making it visible in terminals
+     * that highlight the error stream in red.
+     *
+     * @param message the error description to record; must not be {@code null}
+     */
     public static void logServerError(String message) {
         writeToFile("Server.log", "ERROR", message);
     }
 
+    // -------------------------------------------------------------------------
+    // CLIENT-HANDLER LOGGING
+    // -------------------------------------------------------------------------
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // CLIENT HANDLER LOG METHODS — logs/ClientHandler.log
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /** Logs an INFO-level event from a ClientHandler thread to logs/ClientHandler.log. */
+    /**
+     * Logs an informational message to the client-handler log file
+     * ({@code logs/ClientHandler.log}).
+     *
+     * <p>Use this method for events related to a specific client connection, such as
+     * message receipt or graceful disconnection.
+     *
+     * @param message the informational message to record; must not be {@code null}
+     */
     public static void logClientHandler(String message) {
         writeToFile("ClientHandler.log", "INFO", message);
     }
 
-    /** Logs an ERROR-level event from a ClientHandler thread to logs/ClientHandler.log. */
+    /**
+     * Logs an error message to the client-handler log file
+     * ({@code logs/ClientHandler.log}).
+     *
+     * <p>The entry is also echoed to {@link System#err}.
+     *
+     * @param message the error description to record; must not be {@code null}
+     */
     public static void logClientHandlerError(String message) {
         writeToFile("ClientHandler.log", "ERROR", message);
     }
 
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // REGISTRY LOG METHODS — logs/Registry.log  (NEW — Level 2.4)
-    // ─────────────────────────────────────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // REGISTRY LOGGING
+    // -------------------------------------------------------------------------
 
     /**
-     * Logs an INFO-level event from SharedClientRegistry to logs/Registry.log.
+     * Logs an informational message to the registry log file ({@code logs/Registry.log}).
      *
-     * Level 2.4 addition: replaces raw System.out.println() calls in the registry.
-     * Routes all registry lifecycle output through the synchronized Logger so that
-     * connect/disconnect events are written as complete, uninterleaved log lines
-     * even under high concurrent connection churn.
+     * <p>Use this method for events related to client registration, deregistration, and
+     * lookup operations performed by the registry subsystem.
+     *
+     * @param message the informational message to record; must not be {@code null}
      */
     public static void logRegistry(String message) {
         writeToFile("Registry.log", "INFO", message);
     }
 
     /**
-     * Logs an ERROR-level event from SharedClientRegistry to logs/Registry.log.
+     * Logs an error message to the registry log file ({@code logs/Registry.log}).
      *
-     * Used for broadcast delivery failures and other registry-level errors.
+     * <p>The entry is also echoed to {@link System#err}.
+     *
+     * @param message the error description to record; must not be {@code null}
      */
     public static void logRegistryError(String message) {
         writeToFile("Registry.log", "ERROR", message);
     }
 
+    // -------------------------------------------------------------------------
+    // CLIENT LOGGING
+    // -------------------------------------------------------------------------
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // CLIENT LOG METHODS — logs/ClientID.log
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /** Logs an INFO-level event from the Client (client-side) to logs/ClientID.log. */
+    /**
+     * Logs an informational message to the client log file ({@code logs/ClientID.log}).
+     *
+     * <p>Use this method for client-side events such as connection establishment, message
+     * dispatch, and server responses.
+     *
+     * @param message the informational message to record; must not be {@code null}
+     */
     public static void logClient(String message) {
         writeToFile("ClientID.log", "INFO", message);
     }
 
-    /** Logs an ERROR-level event from the Client (client-side) to logs/ClientID.log. */
+    /**
+     * Logs an error message to the client log file ({@code logs/ClientID.log}).
+     *
+     * <p>The entry is also echoed to {@link System#err}.
+     *
+     * @param message the error description to record; must not be {@code null}
+     */
     public static void logClientError(String message) {
         writeToFile("ClientID.log", "ERROR", message);
     }

@@ -33,8 +33,11 @@ public class SystemIntegrationTest {
         try {
             // Run all 4 required failure scenario tests
             runTest1MultipleReceivers();
+            waitForRegistryEmpty();
             runTest2DisconnectDuringBroadcast();
+            waitForRegistryEmpty();
             runTest3RapidMessaging();
+            waitForRegistryEmpty();
             runTest4ReconnectStorm();
 
             System.out.println("\n==================================================");
@@ -65,6 +68,20 @@ public class SystemIntegrationTest {
                 Thread.sleep(100);
             }
         }
+    }
+
+    private static void waitForRegistryEmpty() throws InterruptedException {
+        long start = System.currentTimeMillis();
+        SharedClientRegistry registry = SharedClientRegistry.getInstance();
+        while (registry.getClientCount() > 0) {
+            if (System.currentTimeMillis() - start > 5000) {
+                System.out.println("[WARNING] Timeout waiting for registry to empty. Current count: " 
+                    + registry.getClientCount());
+                return;
+            }
+            Thread.sleep(50);
+        }
+        System.out.println("[SETUP] Registry is empty and clean.");
     }
 
     /**
