@@ -1,100 +1,128 @@
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 
+// -------------------------------------------------------------------------
+// ServerStats — AegisCore Level 2.4: Synchronization Hardening
+// -------------------------------------------------------------------------
+
 /**
- * ServerStats — Level 2.4: Synchronization Hardening
+ * An immutable, point-in-time snapshot of server telemetry metrics for the
+ * AegisCore multi-threaded server system.
  *
- * Immutable point-in-time snapshot of server telemetry metrics.
- * Produced by SharedClientRegistry.getStats() and safe to pass between threads.
+ * <p>Instances are produced by {@code SharedClientRegistry.getStats()} and
+ * represent a consistent view of server state captured at a single instant.
+ * Callers may freely pass, store, and read {@code ServerStats} objects across
+ * threads without any additional synchronization.
  *
- * ─────────────────────────────────────────────────────────────────────────────
- * WHY IMMUTABLE?
- * ─────────────────────────────────────────────────────────────────────────────
+ * <p><b>Thread-safety / Java Memory Model guarantee:</b><br>
+ * Every field is declared {@code public final}. The Java Memory Model (JMM)
+ * guarantees that all writes to {@code final} fields performed inside a
+ * constructor are flushed and visible to <em>all</em> threads once the
+ * constructor returns. Consequently, no {@code synchronized} block, no
+ * {@code volatile} keyword, and no explicit memory barrier is required on
+ * the reading side — safe publication is achieved automatically.
  *
- *   A stats object may be created on one thread and read on another (e.g., a
- *   monitoring thread, a test assertion, a future admin command handler).
+ * <p><b>Design pattern:</b> Immutable value object (record-like). Once
+ * constructed, the object's state never changes, eliminating entire classes
+ * of data races.
  *
- *   If the fields were mutable, the reading thread might see partially updated
- *   values — a classic memory visibility hazard. The JVM does not guarantee
- *   that writes on one thread are visible to other threads unless a happens-before
- *   relationship is established (via synchronized, volatile, or final).
- *
- *   The Java Memory Model (JMM) guarantees that all writes to FINAL fields made
- *   in the constructor are visible to ALL threads after the constructor returns.
- *   No synchronized, no volatile needed on the reading side.
- *
- *   Rule: value objects passed between threads should always be immutable.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * USAGE
- * ─────────────────────────────────────────────────────────────────────────────
- *
+ * <p><b>Usage example:</b>
+ * <pre>{@code
  *   ServerStats stats = SharedClientRegistry.getInstance().getStats();
  *   Logger.logServer(stats.toString());
- *
- *   Or individual fields:
- *   Logger.logServer("Active clients: " + stats.activeClients);
+ * }</pre>
  */
 public class ServerStats
 {
-    // ─────────────────────────────────────────────────────────────────────────
-    // FIELDS — all final (immutable after construction)
-    // ─────────────────────────────────────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // Static fields
+    // -------------------------------------------------------------------------
 
     /**
-     * Total client connections accepted since server start.
-     * Monotonic — only ever increases. Never reflects disconnections.
-     * Useful for computing total server throughput over time.
+     * Formatter used to render the snapshot timestamp in log output.
+     *
+     * <p>{@link DateTimeFormatter} instances are immutable and inherently
+     * thread-safe, so this constant requires no synchronization regardless of
+     * how many threads call {@link #toString()} concurrently.
+     */
+    private static final DateTimeFormatter FORMATTER =
+        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
+
+    // -------------------------------------------------------------------------
+    // Immutable telemetry fields
+    // -------------------------------------------------------------------------
+
+    /**
+     * Cumulative number of TCP connections accepted by the server since startup.
+     *
+     * <p>This is a monotonically increasing counter; it is never decremented
+     * when a client disconnects. Declared {@code final} to guarantee JMM
+     * safe-publication across threads.
      */
     public final long totalConnectionsAccepted;
 
     /**
-     * Number of clients currently registered in the shared registry.
-     * Snapshot value — may be stale by the time the caller reads it.
-     * That is acceptable: telemetry snapshots are inherently approximate.
+     * Number of clients that were actively connected at the moment this
+     * snapshot was taken.
+     *
+     * <p>Unlike {@link #totalConnectionsAccepted}, this value reflects the
+     * instantaneous live-client count and can both rise and fall over time.
+     * Declared {@code final} to guarantee JMM safe-publication across threads.
      */
     public final int activeClients;
 
     /**
-     * Total number of broadcast events dispatched since server start.
-     * One increment per BroadcastMessage() call — not per recipient.
+     * Total number of messages relayed between clients since server startup.
+     *
+     * <p>Each relay operation — regardless of how many recipients receive the
+     * message — increments this counter by one. Declared {@code final} to
+     * guarantee JMM safe-publication across threads.
      */
     public final long totalMessagesRelayed;
 
     /**
-     * Approximate total bytes written to all client output streams since start.
-     * Approximation based on message char-count × recipient count.
-     * Useful for throughput trending and load profiling in Level 2.5.
+     * Approximate total bytes sent to all clients since server startup.
+     *
+     * <p>Computed as {@code message.length * recipientCount} for each relay
+     * operation. This is an estimate rather than a precise wire-byte count
+     * because it does not account for protocol framing overhead. Declared
+     * {@code final} to guarantee JMM safe-publication across threads.
      */
     public final long totalBytesSent;
 
     /**
-     * ISO-formatted timestamp of when this snapshot was taken.
-     * Allows log correlation: match a stats line to an exact moment in time.
+     * Wall-clock timestamp (formatted as {@code yyyy-MM-dd HH:mm:ss.SSS})
+     * captured at the moment this snapshot was constructed.
+     *
+     * <p>Intended for log correlation: comparing timestamps across successive
+     * {@code ServerStats} snapshots allows operators to measure the rate of
+     * change for any metric. Declared {@code final} to guarantee JMM
+     * safe-publication across threads.
      */
     public final String timestamp;
 
-    /** Formatter for the snapshot timestamp. Thread-safe (DateTimeFormatter is immutable). */
-    private static final DateTimeFormatter FORMATTER =
-        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
-
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // CONSTRUCTOR
-    // ─────────────────────────────────────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // Constructor
+    // -------------------------------------------------------------------------
 
     /**
-     * Constructs an immutable server stats snapshot.
+     * Constructs a new immutable {@code ServerStats} snapshot from the supplied
+     * telemetry values.
      *
-     * Called only from SharedClientRegistry.getStats().
-     * All arguments come from atomic reads — guaranteed to be individually
-     * consistent (though not collectively atomic across all four reads).
-     * That level of precision is sufficient for observability purposes.
+     * <p>The {@link #timestamp} field is set to the wall-clock time at the
+     * moment this constructor executes. After the constructor returns, every
+     * field is permanently fixed and visible to all threads per the JMM
+     * {@code final}-field guarantee.
      *
-     * @param totalConnectionsAccepted  Lifetime connection count from AtomicLong.get()
-     * @param activeClients             Current live count from ConcurrentHashMap.size()
-     * @param totalMessagesRelayed      Lifetime broadcast count from AtomicLong.get()
-     * @param totalBytesSent            Lifetime byte approximation from AtomicLong.get()
+     * @param totalConnectionsAccepted cumulative count of TCP connections
+     *     accepted since server startup; must be {@code >= 0}
+     * @param activeClients            number of clients connected at the
+     *     instant of snapshot creation; must be {@code >= 0}
+     * @param totalMessagesRelayed     cumulative count of messages relayed
+     *     between clients since server startup; must be {@code >= 0}
+     * @param totalBytesSent           approximate cumulative bytes dispatched
+     *     to all clients since server startup (see {@link #totalBytesSent}
+     *     for precision caveats); must be {@code >= 0}
      */
     public ServerStats(long totalConnectionsAccepted,
                        int  activeClients,
@@ -106,23 +134,27 @@ public class ServerStats
         this.totalMessagesRelayed     = totalMessagesRelayed;
         this.totalBytesSent           = totalBytesSent;
 
-        // Capture the exact wall-clock time this snapshot was taken.
-        // LocalDateTime.now() is not timezone-aware — consistent within one JVM.
+        // Capture wall-clock time once, at construction, so the timestamp
+        // is consistent with the metric values recorded above.
         this.timestamp = LocalDateTime.now().format(FORMATTER);
     }
 
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // STRING REPRESENTATION
-    // ─────────────────────────────────────────────────────────────────────────
+    // -------------------------------------------------------------------------
+    // Object overrides
+    // -------------------------------------------------------------------------
 
     /**
-     * Returns a single-line human-readable summary of this stats snapshot.
-     * Suitable for direct use in Logger.logServer() calls.
+     * Returns a human-readable, single-line summary of this snapshot suitable
+     * for structured log output.
      *
-     * Example output:
-     *   [ServerStats @ 2026-05-22 22:55:01.234] Active: 3 | TotalConnected: 7
-     *   | MessagesRelayed: 42 | BytesSent: 8610
+     * <p>The format is:
+     * <pre>
+     * [ServerStats @ yyyy-MM-dd HH:mm:ss.SSS] Active: N | TotalConnected: N |
+     *     MessagesRelayed: N | BytesSent: N
+     * </pre>
+     *
+     * @return a formatted string containing all telemetry fields and the
+     *     snapshot timestamp; never {@code null}
      */
     @Override
     public String toString()
