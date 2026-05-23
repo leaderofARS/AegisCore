@@ -471,6 +471,67 @@ Partial-delivery summary logged when any client was missed:
 ```
 
 Operators get an actionable signal. No ambiguity about which client failed.
+---
+
+## PROBLEM 4 — Message Ordering & Active Failure Logging
+
+### The Ordering Dilemma (Nondeterministic Concurrent Behavior)
+
+Suppose:
+- Client A sends messages rapidly in sequence: `[A1, A2, A3]`
+- Client B sends messages rapidly in sequence: `[B1, B2, B3]`
+
+Under high concurrency, these messages arrive at the server simultaneously across different worker threads. Without structural guardrails, the order in which they are processed, broadcast, and written to the output streams of other clients is entirely non-deterministic. They may arrive at receivers:
+- **Interleaved:** `[A1, B1, A2, B2, A3, B3]`
+- **Reordered:** `[A2, A1, B3, B1, A3, B2]`
+- **Unpredictably timed:** Long pauses followed by rapid bursts due to thread scheduling, TCP congestion control, or lock acquisition delays.
+
+In a multithreaded chat system, we establish **per-client sequence correctness** (messages from Client A must always be received in the order they were sent: `A1 -> A2 -> A3`), but global cross-client ordering remains naturally interleaved depending on when each thread acquires the registry or client handler locks. 
+
+This non-determinism is the core reason concurrent systems are notoriously difficult to design and debug. Bugs are no longer static syntax errors; they become transient, timing-dependent, and highly random anomalies that disappear under local step-through debuggers (often referred to as "Heisenbugs").
+
+---
+
+### Active Failure Logging — The Debugging Imperative
+
+Because concurrent bugs are timing-dependent and notoriously hard to reproduce, **active failure logging** is not a luxury — it is a production necessity. Without detailed logs, diagnosing state corruption or memory leaks becomes absolute nightmare fuel. 
+
+AegisCore implements rigorous active logging across four operational boundaries to guarantee 100% diagnostic visibility:
+
+#### 1. Failed Writes Detection
+Because Java's `PrintWriter` swallows `IOException`s internally, AegisCore actively inspects `output.checkError()` after every write. The moment a write failure is detected, it is logged with high-severity context:
+```text
+[ERROR] [DEAD CLIENT] Write failed for /127.0.0.1:56805 — socket broken. Forcing disconnect.
+```
+
+#### 2. Disconnect Causes
+We differentiate between expected and unexpected terminations. Clean disconnects (the client typed `exit` or closed stdin gracefully) are logged distinctively from abrupt network failures (connection reset / broken pipe):
+* **Graceful Disconnect:**
+  ```text
+  [INFO] Client /127.0.0.1:56808 disconnected cleanly.
+  [INFO] Client disconnected: /127.0.0.1:56808
+  ```
+* **Abrupt Socket/I/O Failure:**
+  ```text
+  [ERROR] I/O error for client /127.0.0.1:56804: An established connection was aborted by the software in your host machine
+  ```
+
+#### 3. Broadcast Errors
+To prevent a single dead connection from crashing a global broadcast loop, the `SharedClientRegistry.BroadcastMessage()` actively catches exceptions per client handler, logs the exact culprit, and continues processing other healthy clients. If delivery was incomplete, a precise partial-delivery warning is logged:
+```text
+[ERROR] [BROADCAST] Dead client evicted mid-broadcast: /127.0.0.1:56805 — message not delivered.
+[ERROR] [BROADCAST] Partial delivery: 4/5 clients received the message.
+```
+
+#### 4. Thread Failures and Lifecycle Events
+Accept-loop failures, thread crashes, and server-wide state changes are tracked actively from `Server.java`, `ClientHandler.java`, and `Client.java`. Standard thread exceptions (such as `IOException`) and unexpected JVM-level crashes (such as `RuntimeException` or `OutOfMemoryError`) are intercepted by specialized catch-all `Throwable` blocks on all background worker threads. This guarantees that thread crashes are written cleanly to safe file-based logs instead of silently vaporizing.
+
+Thread names are also formatted predictably (e.g., `ClientHandler-56804`) to make thread dumps and stack traces immediately readable in log files:
+```text
+[INFO] Server is listening on port 5000
+[INFO] New client connected: 127.0.0.1
+[ERROR] UNEXPECTED THREAD CRASH for client /127.0.0.1:56804: java.lang.NullPointerException
+```
 
 ---
 

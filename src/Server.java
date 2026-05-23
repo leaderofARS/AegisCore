@@ -146,6 +146,9 @@ public class Server {
                 // Unexpected I/O failure while the socket should still be open.
                 Logger.logServerError("Server error occurred: " + e.getMessage());
             }
+        } catch (Throwable t) {
+            // Catch unexpected thread crashes (e.g. RuntimeException, OutOfMemoryError) to prevent silent loss of diagnostics
+            Logger.logServerError("UNEXPECTED SERVER PROCESS CRASH: " + t.getMessage());
         }
     }
 
