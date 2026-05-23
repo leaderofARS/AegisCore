@@ -249,6 +249,9 @@ public class ClientHandler implements Runnable
             // Socket errors (reset, timeout, etc.) are non-fatal for the server;
             // log and fall through to cleanup.
             Logger.logClientHandlerError("I/O error for client " + clientId + ": " + e.getMessage());
+        } catch (Throwable t) {
+            // Catch unexpected thread crashes (e.g. RuntimeException, OutOfMemoryError) to prevent silent loss of diagnostics
+            Logger.logClientHandlerError("UNEXPECTED THREAD CRASH for client " + clientId + ": " + t.getMessage());
         } finally {
             // Runs whether the loop exited normally, via break, or via exception.
             cleanup();

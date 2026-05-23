@@ -113,6 +113,9 @@ public class Client {
                     if (!socket.isClosed()) {
                         Logger.logClientError("Error reading from server: " + e.getMessage());
                     }
+                } catch (Throwable t) {
+                    // Catch unexpected thread crashes (e.g. RuntimeException) to prevent silent loss of diagnostics
+                    Logger.logClientError("Unexpected crash in ServerListener thread: " + t.getMessage());
                 }
             });
 
