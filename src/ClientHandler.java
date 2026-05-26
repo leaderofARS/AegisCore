@@ -1,303 +1,178 @@
 import java.io.*;
 import java.net.*;
-
-// -----------------------------------------------------------------------------
-// ClientHandler — Level 2.4: Synchronization Hardening
-// -----------------------------------------------------------------------------
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Manages the full lifecycle of a single connected client on a dedicated thread.
  *
- * <p>One {@code ClientHandler} instance is created per accepted {@link Socket}.
- * It is submitted to an executor (or started as a raw {@link Thread}) and owns
- * the read loop for its client. Other client threads may concurrently call
- * {@link #sendMessage} on this instance via
- * {@link SharedClientRegistry#BroadcastMessage}, so all output operations are
- * serialized through a single {@code synchronized} method.
+ * <p>One instance is created per accepted {@link Socket}. It owns the client's read
+ * loop and exposes {@link #sendMessage(String)} for concurrent broadcast calls from
+ * peer threads. All output to a given client is serialized through the
+ * {@code synchronized} {@link #sendMessage(String)} method, which uses {@code this}
+ * as its monitor — writes to distinct clients therefore proceed in parallel.
  *
- * <h3>Threading model</h3>
- * <pre>
- *   Thread A — this client's own thread:  runs the read loop inside {@link #run()}.
- *   Thread B — a peer client's thread:    calls {@link #sendMessage} via broadcast.
- *   Thread C — yet another peer thread:   also calls {@link #sendMessage}.
- * </pre>
- * All three threads may attempt to write to the same {@link java.io.OutputStream}
- * concurrently. The single shared {@link PrintWriter} field, combined with the
- * {@code synchronized} keyword on {@link #sendMessage}, ensures that only one
- * thread writes at a time for this specific instance.
+ * <p>A single {@link java.io.PrintWriter} is stored as a field and shared by both
+ * the read loop and broadcast callers, ensuring that only one wrapper ever touches
+ * the underlying {@link java.io.OutputStream} at a time.
  *
- * <h3>Why a shared {@code PrintWriter} field (not a local one per call)</h3>
- * Prior to Level 2.4, {@code sendMessage()} created a fresh {@link PrintWriter}
- * on every invocation while {@code run()} held a separate local one — two
- * distinct wrappers around the same underlying {@link java.io.OutputStream}.
- * Even with {@code synchronized} on {@code sendMessage()}, the unsynchronized
- * writes from {@code run()} raced with broadcast writes, producing interleaved
- * byte sequences such as:
- * <pre>
- *   [Ali[Bob]]: hello
- * </pre>
- * The fix: one {@link PrintWriter} stored as a field; every write, including
- * those from {@code run()}, goes through {@link #sendMessage()}.
- *
- * <h3>Lock granularity</h3>
- * The monitor used is {@code this} — the individual {@code ClientHandler}
- * instance. Thread A writing to Client X holds <em>Client X's</em> lock.
- * Thread B writing to Client Y holds <em>Client Y's</em> lock. They never
- * contend with each other, so writes to distinct clients proceed in parallel.
- * Only concurrent writes targeting the <em>same</em> client are serialized.
- *
- * <p>This class is <strong>thread-safe</strong>.
+ * <p>This class is thread-safe.
  */
 public class ClientHandler implements Runnable
 {
-    // -------------------------------------------------------------------------
-    // Fields
-    // -------------------------------------------------------------------------
-
-    /** Registry shared across all active {@code ClientHandler} instances. Used
-     *  to register/deregister this client and to broadcast messages. */
     private final SharedClientRegistry registry;
-
-    /** The TCP socket accepted from the server's {@link java.net.ServerSocket}.
-     *  Closed in {@link #closeSocket()} once the client disconnects or is
-     *  forcibly removed. */
     private final Socket socket;
-
-    /** Stable, human-readable identifier derived from the remote socket address.
-     *  Computed once at construction and never mutated, so no synchronization
-     *  is needed for reads. */
     private final String clientId;
-
-    /** The sole {@link PrintWriter} wrapping this client's output stream.
-     *  Initialized in {@link #run()} before {@code active} is set to
-     *  {@code true}; after that point, every write goes through
-     *  {@link #sendMessage(String)}, which is {@code synchronized}. */
-    private PrintWriter output;
-
-    /** Indicates whether this handler is ready to accept outbound messages.
-     *  Declared {@code volatile} so that reads from threads that do not hold
-     *  this object's monitor (e.g., a fast-path check in a polling loop) always
-     *  observe the most recently written value. Authoritative mutations are
-     *  performed inside {@code synchronized} blocks to guarantee
-     *  check-then-act atomicity. */
-    private volatile boolean active = false;
-
-    // -------------------------------------------------------------------------
-    // Constructor
-    // -------------------------------------------------------------------------
+    private PrintWriter  output;
 
     /**
-     * Constructs a {@code ClientHandler} for the given accepted socket.
+     * {@code true} while the handler is ready to accept outbound messages.
+     * Written inside {@code synchronized} blocks for check-then-act atomicity;
+     * declared {@code volatile} so unsynchronized readers observe the latest value.
+     */
+    private volatile boolean active = false;
+
+    /**
+     * Guarantees that the dead-client eviction log line is emitted at most once,
+     * even when multiple broadcast threads concurrently discover the same inactive handler.
+     * The first thread to win the CAS from {@code false → true} logs; all others skip.
+     */
+    private final AtomicBoolean evictionLogged = new AtomicBoolean(false);
+
+    /**
+     * Set to {@code true} by {@link #forceDisconnect()} before the socket is closed,
+     * allowing {@link #run()} to distinguish a forced teardown from a client-initiated
+     * clean exit when selecting the disconnect log message.
+     */
+    private volatile boolean forcedDisconnect = false;
+
+    /**
+     * Constructs a handler for the given accepted socket.
      *
-     * <p>The client identifier is derived from the socket's remote address so
-     * that log messages are immediately traceable without an additional lookup.
-     *
-     * @param socket   the accepted client {@link Socket}; must be open and
-     *                 connected
-     * @param registry the shared registry used to track all active clients and
-     *                 to relay broadcast messages
+     * @param socket   open, connected client socket
+     * @param registry shared registry used to register, deregister, and broadcast
      */
     public ClientHandler(Socket socket, SharedClientRegistry registry)
     {
         this.socket   = socket;
         this.registry = registry;
-        // Capture the remote address once; InetSocketAddress.toString() is
-        // stable for the lifetime of the connection.
         this.clientId = socket.getRemoteSocketAddress().toString();
     }
 
-    // -------------------------------------------------------------------------
-    // Public accessors
-    // -------------------------------------------------------------------------
-
-    /**
-     * Returns the stable string identifier for this client.
-     *
-     * <p>The identifier is the remote socket address captured at construction
-     * time and never changes, so this method requires no synchronization.
-     *
-     * @return a non-null string identifying the remote endpoint, e.g.
-     *         {@code "/127.0.0.1:54321"}
-     */
+    /** Returns the stable remote-address identifier for this client. */
     public String getClientId() { return clientId; }
 
-    /**
-     * Returns {@code true} if this handler is currently active and accepting
-     * outbound messages.
-     *
-     * <p>Because {@code active} is {@code volatile}, callers that do not hold
-     * this object's monitor will still observe the latest value. This method
-     * is intended for diagnostic or administrative checks; authoritative
-     * lifecycle decisions are made inside {@code synchronized} blocks.
-     *
-     * @return {@code true} if the handler is active; {@code false} if it has
-     *         been shut down or not yet started
-     */
+    /** Returns {@code true} if the handler is active and accepting outbound messages. */
     public boolean isActive() { return active; }
 
-    // -------------------------------------------------------------------------
-    // Outbound message dispatch
-    // -------------------------------------------------------------------------
+    /**
+     * Claims the right to log this handler's dead-client eviction, returning {@code true}
+     * exactly once across all concurrent callers. Implemented as a single atomic CAS.
+     *
+     * @return {@code true} if this call is the first to claim the log right
+     */
+    public boolean claimEvictionLog()
+    {
+        return evictionLogged.compareAndSet(false, true);
+    }
 
     /**
-     * Sends a text message to this client over its output stream.
+     * Delivers a message to this client, serialized against concurrent broadcast calls.
+     * If {@link java.io.PrintWriter#checkError()} reports a broken stream after the write,
+     * the handler tears itself down via {@link #forceDisconnect()}.
+     * This method is a no-op when the handler is inactive.
      *
-     * <p>Acquires {@code this} object's monitor before writing so that
-     * concurrent broadcast calls from peer threads are serialized. If the
-     * underlying stream signals an error after the write, the socket is
-     * forcibly closed via {@link #forceDisconnect()}.
-     *
-     * <p>This method is a no-op if the handler is not active, allowing callers
-     * to invoke it without checking the lifecycle state themselves.
-     *
-     * @param message the line of text to deliver; a newline is appended by
-     *                {@link PrintWriter#println(String)}
+     * @param message text to deliver; a newline is appended automatically
      */
     public synchronized void sendMessage(String message)
     {
-        // Guard against writes to a handler that has already been torn down.
         if (!active) { return; }
         output.println(message);
         if (output.checkError()) {
-            // The socket was closed on the remote end between the activity
-            // check above and the actual write; tear down immediately rather
-            // than leaving a zombie entry in the registry.
-            Logger.logClientHandlerError(
-                "[DEAD CLIENT] Write failed for " + clientId + " — socket broken. Forcing disconnect."
-            );
+            if (claimEvictionLog()) {
+                Logger.logClientHandlerError(
+                    "[DEAD CLIENT] Write failed for " + clientId + " — forcing disconnect."
+                );
+            }
             forceDisconnect();
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Lifecycle control
-    // -------------------------------------------------------------------------
-
     /**
-     * Forcibly disconnects this client by marking it inactive and closing its
-     * socket.
-     *
-     * <p>Acquires {@code this} object's monitor to guarantee that the
-     * check-then-act sequence ({@code if (!active) … active = false}) is
-     * atomic with respect to concurrent calls from broadcast threads or the
-     * client's own read loop.
-     *
-     * <p>Idempotent: subsequent calls after the first are silently ignored.
+     * Forcibly closes this client's connection.
+     * Sets {@link #forcedDisconnect} before closing the socket so {@link #run()} can
+     * log the correct disconnect reason. Idempotent — subsequent calls are no-ops.
      */
     synchronized void forceDisconnect()
     {
-        // Prevent double-close if multiple threads race to disconnect.
         if (!active) { return; }
+        forcedDisconnect = true;
         active = false;
         closeSocket();
     }
 
-    // -------------------------------------------------------------------------
-    // Runnable entry point
-    // -------------------------------------------------------------------------
-
     /**
-     * Runs the read loop for this client on the calling thread.
+     * Read loop for this client's dedicated thread.
      *
-     * <p>Initializes the shared {@link PrintWriter}, registers this handler in
-     * the {@link SharedClientRegistry}, then blocks on
-     * {@link BufferedReader#readLine()} until the client disconnects, sends
-     * {@code "exit"}, or an I/O error occurs. Each received line is
-     * acknowledged back to the sender and broadcast to all other connected
-     * clients. Cleanup is performed in a {@code finally} block regardless of
-     * how the loop exits.
-     *
-     * <p>This method must be called from at most one thread per instance.
+     * <p>Initialises the output stream, registers with the registry, then blocks on
+     * {@link java.io.BufferedReader#readLine()} until the client disconnects, sends
+     * {@code "exit"}, or an I/O error occurs. Each inbound line is acknowledged and
+     * broadcast to all other clients. Cleanup runs unconditionally in the
+     * {@code finally} block.
      */
     @Override
     public void run()
     {
         try {
-            // Initialize output before marking active=true so that sendMessage()
-            // never observes a null PrintWriter.
             output = new PrintWriter(socket.getOutputStream(), true);
             BufferedReader input = new BufferedReader(new InputStreamReader(socket.getInputStream()));
 
-            // Publish active=true inside a synchronized block so that any
-            // thread already waiting in sendMessage() sees a consistent state.
             synchronized (this) { active = true; }
 
             registry.addClient(clientId, this);
             sendMessage("[SERVER] Connected. Welcome to AegisCore server!");
 
             String message;
-            // Blocks this thread until the client sends a line, closes the
-            // connection, or the socket is closed by forceDisconnect().
             while ((message = input.readLine()) != null)
             {
                 Logger.logClientHandler("Client " + clientId + " says: " + message);
-                // Echo an acknowledgement before broadcasting so the sender
-                // gets immediate confirmation regardless of broadcast latency.
                 sendMessage("[ACK] Received: " + message);
                 registry.BroadcastMessage("[" + clientId + "]: " + message);
 
                 if (message.equalsIgnoreCase("exit")) {
-                    // Honour the client's explicit disconnect request; break
-                    // before the next readLine() attempt.
                     sendMessage("[SERVER] Goodbye. Connection closing.");
                     break;
                 }
             }
-            Logger.logClientHandler("Client " + clientId + " disconnected cleanly.");
+
+            if (forcedDisconnect) {
+                Logger.logClientHandler("Client " + clientId + " disconnected (forced).");
+            } else {
+                Logger.logClientHandler("Client " + clientId + " disconnected cleanly.");
+            }
 
         } catch (IOException e) {
-            // Socket errors (reset, timeout, etc.) are non-fatal for the server;
-            // log and fall through to cleanup.
             Logger.logClientHandlerError("I/O error for client " + clientId + ": " + e.getMessage());
         } catch (Throwable t) {
-            // Catch unexpected thread crashes (e.g. RuntimeException, OutOfMemoryError) to prevent silent loss of diagnostics
-            Logger.logClientHandlerError("UNEXPECTED THREAD CRASH for client " + clientId + ": " + t.getMessage());
+            Logger.logClientHandlerError("Unexpected crash for client " + clientId + ": " + t.getMessage());
         } finally {
-            // Runs whether the loop exited normally, via break, or via exception.
             cleanup();
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Private helpers
-    // -------------------------------------------------------------------------
-
-    /**
-     * Deregisters this client and releases its socket.
-     *
-     * <p>Marks the handler inactive inside a {@code synchronized} block to
-     * prevent any in-flight {@link #sendMessage} call from writing after the
-     * socket has been closed.
-     */
     private void cleanup()
     {
-        // Synchronize so that the active flag flip is visible to all threads
-        // before the socket is closed underneath them.
         synchronized (this) { active = false; }
         registry.removeClient(clientId);
         closeSocket();
     }
 
-    /**
-     * Closes the underlying socket, suppressing and logging any
-     * {@link IOException} that arises during the close attempt.
-     *
-     * <p>Acquiring {@code this} monitor prevents a race between a concurrent
-     * {@link #forceDisconnect()} call and the {@link #cleanup()} path where
-     * both could attempt to close the socket simultaneously.
-     */
     private synchronized void closeSocket()
     {
-        // Skip if the socket was already closed by a prior code path.
         if (socket == null || socket.isClosed()) { return; }
         try {
             socket.close();
         } catch (IOException e) {
-            // Failure to close is logged but not rethrown; the connection is
-            // already considered terminated from the application's perspective.
-            Logger.logClientHandlerError(
-                "Failed to close socket for client " + clientId + ": " + e.getMessage()
-            );
+            Logger.logClientHandlerError("Failed to close socket for " + clientId + ": " + e.getMessage());
         }
     }
 }

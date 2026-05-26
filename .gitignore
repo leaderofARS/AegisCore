@@ -57,6 +57,7 @@ logs/
 # System failure scenario docs
 failure_scenarios.md
 SUCCESSCRITERIA.md
+FIXES.md
 
 .antigravitycli
 AGENTS
