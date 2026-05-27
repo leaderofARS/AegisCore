@@ -1,32 +1,33 @@
+package core;
+
 import java.io.*;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 
 /**
- * Centralised, file-backed logging utility for the AegisCore server.
+ * Centralised, file-backed logging utility for AegisCore.
  *
  * <p>Each subsystem writes to its own dedicated log file under {@code logs/}:
  * <ul>
  *   <li>{@code Server.log} — server lifecycle events</li>
- *   <li>{@code ClientHandler.log} — per-client connection events</li>
- *   <li>{@code Registry.log} — broadcast and registration events</li>
- *   <li>{@code ClientID.log} — client-side events</li>
+ *   <li>{@code ClientHandler.log} — per-player connection events</li>
+ *   <li>{@code Registry.log} — room, player, and matchmaking events</li>
+ *   <li>{@code ClientID.log} — test-client events</li>
  * </ul>
  *
- * <p><b>Thread safety:</b> Each log file is protected by its own dedicated {@code Object}
- * monitor ({@link #SERVER_LOCK}, {@link #HANDLER_LOCK}, {@link #REGISTRY_LOCK},
- * {@link #CLIENT_LOCK}). Writes to different files proceed in parallel; only concurrent
- * writes to the <em>same</em> file are serialized.
+ * <p>Each log file is protected by its own {@code Object} monitor, allowing
+ * concurrent writes to different files to proceed in parallel. Only writes
+ * to the same file are serialised.
  *
- * <p>{@code INFO} entries are echoed to {@link System#out}; {@code ERROR} entries to
- * {@link System#err}. The {@code logs/} directory is created at class-load time if absent.
+ * <p>{@code INFO} entries echo to {@link System#out}; {@code ERROR} to {@link System#err}.
+ * The {@code logs/} directory is created at class-load time if absent.
  *
- * <p>This class is a non-instantiable static utility.
+ * <p>Non-instantiable static utility.
  */
-public class Logger {
+public final class Logger {
 
-    private static final String              LOG_DIR   = "logs";
-    private static final DateTimeFormatter   FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
+    private static final String            LOG_DIR   = "logs";
+    private static final DateTimeFormatter FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
 
     private static final Object SERVER_LOCK   = new Object();
     private static final Object HANDLER_LOCK  = new Object();
@@ -40,29 +41,13 @@ public class Logger {
 
     private Logger() {}
 
-    /**
-     * Formats and appends a single log entry to the specified file, then echoes it to
-     * the appropriate standard stream. Must be called while the caller holds the
-     * corresponding per-file lock.
-     *
-     * @param filename bare filename within {@value #LOG_DIR}
-     * @param level    severity label, e.g. {@code "INFO"} or {@code "ERROR"}
-     * @param message  log message text
-     */
     private static void writeToFile(String filename, String level, String message) {
-        String logEntry = String.format("[%s] [%s] %s", LocalDateTime.now().format(FORMATTER), level, message);
-
-        if ("ERROR".equals(level)) {
-            System.err.println(logEntry);
-        } else {
-            System.out.println(logEntry);
-        }
-
-        File file = new File(LOG_DIR, filename);
-        try (PrintWriter writer = new PrintWriter(new FileWriter(file, true))) {
-            writer.println(logEntry);
+        String entry = String.format("[%s] [%s] %s", LocalDateTime.now().format(FORMATTER), level, message);
+        ("ERROR".equals(level) ? System.err : System.out).println(entry);
+        try (PrintWriter w = new PrintWriter(new FileWriter(new File(LOG_DIR, filename), true))) {
+            w.println(entry);
         } catch (IOException e) {
-            System.err.println("[ERROR] Failed to write to log file " + filename + ": " + e.getMessage());
+            System.err.println("[ERROR] Cannot write to " + filename + ": " + e.getMessage());
         }
     }
 
