@@ -131,7 +131,12 @@ public class ClientHandler implements Runnable {
             }
 
         } catch (IOException e) {
-            Logger.logClientHandlerError("I/O error for " + sessionId + ": " + e.getMessage());
+            String msg = e.getMessage();
+            if (msg != null && msg.toLowerCase().contains("connection reset")) {
+                Logger.logClientHandler("Player " + sessionId + " closed connection abruptly.");
+            } else {
+                Logger.logClientHandlerError("I/O error for " + sessionId + ": " + msg);
+            }
         } catch (Throwable t) {
             Logger.logClientHandlerError("Unexpected crash for " + sessionId + ": " + t.getMessage());
         } finally {
