@@ -131,7 +131,7 @@ public class MatchmakingQueue implements Runnable {
         );
         for (Player p : players) {
             room.addPlayer(p);
-            p.send("[MATCH] ✦ Match found! You have been placed in room: " + room.getRoomId());
+            p.send("[MATCH] Match found! You have been placed in room: " + room.getRoomId());
         }
         room.broadcast("[MATCH] Match created with " + players.size() +
                        " players. Type READY when you are prepared to enter the session.");

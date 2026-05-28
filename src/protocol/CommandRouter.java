@@ -166,7 +166,7 @@ public class CommandRouter {
         }
         Room room = roomRegistry.createRoom(roomName, ctx.player.getSessionId(), maxPlayers);
         room.addPlayer(ctx.player);
-        ctx.player.send("[SERVER] Room created → " + room.getRoomId() + " | \"" + roomName + "\" | " + maxPlayers + " slots");
+        ctx.player.send("[SERVER] Room created: " + room.getRoomId() + " | \"" + roomName + "\" | " + maxPlayers + " slots");
         ctx.player.send("[SERVER] Share this ID to invite others: " + room.getRoomId());
         ctx.player.send("[SERVER] Type READY when you are prepared to start.");
     }
@@ -217,12 +217,12 @@ public class CommandRouter {
             ctx.player.send("[SERVER] No open rooms. Create one with: CREATE <name> [slots]");
             return;
         }
-        ctx.player.send("[SERVER] ╔══ Open Rooms ══════════════════════════╗");
+        ctx.player.send("[SERVER] === Open Rooms ===================================");
         ctx.player.send(String.format("[SERVER]   %-8s %-20s %-8s %s", "ID", "Name", "Players", "Status"));
         for (Room r : open) {
             ctx.player.send("[SERVER]   " + r.getSnapshot());
         }
-        ctx.player.send("[SERVER] ╚════════════════════════════════════════╝");
+        ctx.player.send("[SERVER] =================================================");
     }
 
     private void handleReady(CommandContext ctx) {
@@ -258,7 +258,7 @@ public class CommandRouter {
         }
         boolean queued = matchmakingQueue.enqueue(ctx.player);
         if (queued) {
-            ctx.player.send("[MATCH] ✦ You entered the matchmaking queue. Position: ~" + matchmakingQueue.getQueueSize());
+            ctx.player.send("[MATCH] * You entered the matchmaking queue. Position: ~" + matchmakingQueue.getQueueSize());
             ctx.player.send("[MATCH]   Type DEQUEUE to leave the queue.");
         }
     }
@@ -285,12 +285,12 @@ public class CommandRouter {
     }
 
     private void handleStats(CommandContext ctx) {
-        ctx.player.send("[SERVER] ╔══ AegisCore Stats ═══════════════════╗");
+        ctx.player.send("[SERVER] === AegisCore Stats ===========================");
         ctx.player.send("[SERVER]   Players online : " + playerRegistry.getPlayerCount());
         ctx.player.send("[SERVER]   Active rooms   : " + roomRegistry.getActiveRoomCount());
         ctx.player.send("[SERVER]   Queue size     : " + matchmakingQueue.getQueueSize());
         ctx.player.send("[SERVER]   Total connects : " + playerRegistry.getTotalConnections());
-        ctx.player.send("[SERVER] ╚═══════════════════════════════════════╝");
+        ctx.player.send("[SERVER] =================================================");
     }
 
     private void handleQuit(CommandContext ctx) {

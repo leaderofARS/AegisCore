@@ -215,7 +215,7 @@ public class Room {
                 state = RoomState.IN_PROGRESS;
                 for (Player p : players) { p.setStatus(PlayerStatus.IN_GAME); }
             }
-            broadcast("[INFO] ⚔  Game session started! Good luck.");
+            broadcast("[INFO] Game session started! Good luck.");
             Logger.logRegistry("Room " + roomId + " transitioned to IN_PROGRESS.");
         }, 5, TimeUnit.SECONDS);
     }
