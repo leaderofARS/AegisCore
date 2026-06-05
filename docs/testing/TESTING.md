@@ -1,199 +1,96 @@
-# Testing Documentation
+# AegisCore Testing Infrastructure
 
-**Project:** Distributed Multithreaded Secure Server Platform
-**Version:** 0.2.0 | **Date:** 2026-05-18
-
----
-
-## 1. Testing Philosophy
-
-This project tests at three levels:
-1. **Unit tests** — individual method and class behavior
-2. **Integration tests** — server + client interaction over real sockets
-3. **Stress tests** — concurrent load to verify thread safety and stability
-
-**Rule:** If it's not tested, it's broken. Document every test case — not just that it passed, but what it was supposed to verify.
+This document details the test suites, verification scripts, and automated scenarios used to ensure the reliability, performance, and concurrency safety of the **AegisCore** Game Lobby Server.
 
 ---
 
-## 2. Current Test Coverage
+## 1. Test Harness Overview
 
-| Component | Test Type | Status |
-|-----------|-----------|--------|
-| Server socket binding | Manual | ✅ Tested |
-| Single client connect + disconnect | Manual | ✅ Tested |
-| Multiple simultaneous clients | Manual (3 terminals) | ✅ Tested |
-| `exit` command termination | Manual | ✅ Tested |
-| Server stability after client crash | Manual | ✅ Tested |
-| Automated unit tests | JUnit | ⏳ Level 4 |
-| Stress test (100+ clients) | Automated | ⏳ Level 6 |
+AegisCore is validated across three distinct testing tiers:
+
+| Test Suite | File Location | Type | Verification Concern |
+| :--- | :--- | :---: | :--- |
+| **System Integration Test** | [SystemIntegrationTest.java](file:///C:/Users/Asus/Desktop/MultiThreadSystemJAVA/tests/SystemIntegrationTest.java) | Integration | Concurrency safety, registry stability, socket write contention |
+| **Load Test Harness** | [LoadTest.java](file:///C:/Users/Asus/Desktop/MultiThreadSystemJAVA/tests/LoadTest.java) | Stress/Load | Thread capacity bounds, connection storms, message throughput |
+| **End-to-End Test Script** | [e2e-lobby-test.ps1](file:///C:/Users/Asus/Desktop/MultiThreadSystemJAVA/scripts/e2e-lobby-test.ps1) | Functional E2E | Commands, state transitions, countdowns, matchmaking |
 
 ---
 
-## 3. Manual Test Cases
+## 2. Integration Scenarios
 
-### TC-001: Server Start
+The `SystemIntegrationTest.java` suite runs four concurrent scenarios under a simulated local network:
 
-**Objective:** Verify server binds and listens on port 5000.
-
-**Steps:**
-1. Compile: `javac Server.java ClientHandler.java Client.java`
-2. Run: `java Server`
-3. Observe console output
-
-**Expected:** `Server is listening on port 5000`
-
-**Result:** ✅ PASS
+1. **Multiple Receivers:** Verifies that global or room broadcasts reach all connected clients.
+2. **Disconnect During Broadcast:** Verifies that a client dropping mid-broadcast does not crash the broadcasting thread or cause other active clients to lose messages.
+3. **Rapid Messaging (Spam Storm):** Simulates high-frequency concurrent broadcasts to verify thread safety and lack of lock contention.
+4. **Reconnect Storm (Zombie Defense):** Opens and closes connections rapidly to ensure the player registry evicts sockets cleanly without creating "zombie" threads or connection leaks.
 
 ---
 
-### TC-002: Single Client Connect
+## 3. How to Run the Tests
 
-**Objective:** Verify a client can connect and receive welcome message.
+### 3.1 Prerequisite Compilation
+Compile all source files and test harnesses before running:
+```bash
+# Compile core sources
+javac -d bin src/core/*.java src/matchmaking/*.java src/player/*.java src/protocol/*.java src/room/*.java src/server/*.java
 
-**Steps:**
-1. Server running
-2. `java Client` in new terminal
-
-**Expected:**
-```
-Connected to server!
-Enter message to send to server (type 'exit' to quit):
+# Compile test suite
+javac -cp bin -d bin tests/*.java
 ```
 
-**Result:** ✅ PASS
-
----
-
-### TC-003: Message Echo
-
-**Objective:** Verify client message is received by server and echoed back.
-
-**Steps:**
-1. Client connected
-2. Type: `hello world`
-3. Press Enter
-
-**Expected (client terminal):** `Server received: hello world`
-**Expected (server terminal):** `Client says: hello world`
-
-**Result:** ✅ PASS
-
----
-
-### TC-004: Clean Disconnect
-
-**Objective:** Verify `exit` terminates session cleanly.
-
-**Steps:**
-1. Client connected
-2. Type: `exit`
-
-**Expected (client):** `Server received: exit` → program ends
-**Expected (server):** `Client disconnected.`
-
-**Result:** ✅ PASS
-
----
-
-### TC-005: Multi-Client Isolation
-
-**Objective:** Verify multiple clients can communicate simultaneously without interference.
-
-**Steps:**
-1. Server running
-2. Open 3 terminals, run `java Client` in each
-3. Send messages from each independently
-4. Verify each sees only its own responses
-
-**Expected:** All 3 clients receive responses. No cross-contamination.
-**Expected (server):** 3 separate "New client connected" lines, 3 threads active.
-
-**Result:** ✅ PASS
-
----
-
-### TC-006: Server Survives Client Crash
-
-**Objective:** Verify server continues after a client abruptly closes.
-
-**Steps:**
-1. Client connected
-2. Kill client terminal (close window, not `exit`)
-3. Connect a new client
-
-**Expected:** Server catches `IOException`, logs "Client disconnected.", continues accepting.
-
-**Result:** ✅ PASS
-
----
-
-## 4. Planned Test Cases (Future Levels)
-
-### TC-100: Thread Pool Limit (Level 6)
-
-**Objective:** Verify server rejects connections beyond pool size gracefully (no crash).
-
-**Steps:** Automated — spawn 250 client threads, pool size = 200.
-**Expected:** 200 handled, 50 queued or rejected with appropriate message.
-
----
-
-### TC-101: Race Condition — Concurrent Broadcast (Level 3)
-
-**Objective:** Verify no `ConcurrentModificationException` during simultaneous connect + broadcast.
-
-**Steps:**
-1. 50 clients connected
-2. Thread A broadcasts to all clients
-3. Thread B disconnects 10 clients simultaneously
-4. Repeat 1000 times
-
-**Expected:** No exceptions. All remaining clients receive broadcast.
-
----
-
-### TC-102: Authentication — Brute Force Protection (Level 8)
-
-**Objective:** Verify account lockout after 5 failed login attempts.
-
-**Steps:** Send `/login alice wrongpassword` 6 times.
-**Expected:** First 5 return `ERROR: Invalid credentials`. 6th returns `ERROR: Account locked.`
-
----
-
-### TC-103: Stress Test — 500 Concurrent Clients (Level 6)
-
-**Objective:** Verify server stability under sustained load.
-
-**Steps:**
-1. Spawn 500 client threads simultaneously
-2. Each sends 100 messages
-3. Each disconnects cleanly
-
-**Expected:**
-- No server crash
-- No messages lost
-- All clients receive all responses
-- Server memory stable (no leak)
-
----
-
-## 5. Test Infrastructure (Level 4+)
-
-```
-tests/
- ├── unit/
- │   ├── CommandParserTest.java
- │   ├── AuthServiceTest.java
- │   └── MessageServiceTest.java
- ├── integration/
- │   ├── ServerClientTest.java
- │   └── MultiClientTest.java
- └── stress/
-     └── LoadTest.java          ← spawns N threads, measures throughput
+### 3.2 Running the Integration Tests
+Execute the Java system integration suite:
+```bash
+java -cp bin tests.SystemIntegrationTest
 ```
 
-**Framework:** JUnit 5 + Mockito
-**Build integration:** Maven Surefire plugin
-**CI:** GitHub Actions (Level 15)
+### 3.3 Running the Load Test
+Execute the load test harness (simulates multiple virtual clients):
+```bash
+java -cp bin tests.LoadTest
+```
+
+### 3.4 Running the E2E PowerShell Script
+Run the automated end-to-end user sequence simulation:
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/e2e-lobby-test.ps1
+```
+
+### 3.5 Running the Stress Script
+Run the automated stress simulation harness:
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/stress-test.ps1
+```
+
+---
+
+## 4. Test Results
+
+A verified run of the `SystemIntegrationTest` should output the following logs:
+
+```
+==================================================
+   AEGISCORE CONCURRENCY INTEGRATION HARNESS      
+==================================================
+[SETUP] Test Server ready and listening.
+
+[TEST 1] Testing Multiple Receivers...
+-> [TEST 1] PASS: All clients successfully received parallel broadcasts.
+
+[TEST 2] Testing Disconnect During Broadcast...
+-> [TEST 2] PASS: Server handled connection sever during broadcast loop gracefully.
+
+[TEST 3] Testing Rapid Messaging (Spam Storm)...
+-> [TEST 3] PASS: Concurrent messaging spam completed with no deadlocks or server freezes.
+
+[TEST 4] Testing Reconnect Storm (Zombie Defense)...
+Total rapid sessions executed: 80
+Connection/Transmission failures: 0
+Registry state (active sessions count): 0
+-> [TEST 4] PASS: Reconnect storm finished cleanly with exactly 0 zombie sessions in registry.
+
+==================================================
+  ALL 4 SYSTEM CONCURRENCY TESTS PASSED SUCCESSFULLY!  
+==================================================
+```

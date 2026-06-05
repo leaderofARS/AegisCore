@@ -1,113 +1,91 @@
-# Deployment Documentation
+# AegisCore Deployment Guide
 
-**Project:** Distributed Multithreaded Secure Server Platform
-**Version:** 0.2.0 | **Date:** 2026-05-18
-
----
-
-## Current Stage: Local Development Only
-
-The server runs on a single machine. No containerization, no cloud. This document records current deployment steps and projects forward to production deployment at Level 15.
+This document describes how to compile, run, test, and deploy the **AegisCore** Game Lobby Server in local and production environments.
 
 ---
 
-## 1. Local Deployment (Level 1–3)
+## 1. Prerequisites
+- **Java Development Kit (JDK):** Java 21 LTS or newer. Verify using:
+  ```bash
+  java --version
+  ```
+- **Operating System:** Cross-platform (Windows, Linux, macOS supported).
 
-### Prerequisites
-- Java 21 JDK: `java --version` → `openjdk 21.x.x`
-- All files in same directory or on classpath
+---
 
-### Compile
+## 2. Compilation
+Compile all packages into a unified binary directory (`bin/`). Run the following command from the project root directory:
+
 ```bash
-cd src
-javac Server.java ClientHandler.java Client.java
+javac -d bin src/core/*.java src/matchmaking/*.java src/player/*.java src/protocol/*.java src/room/*.java src/server/*.java
 ```
 
-### Run Server
+---
+
+## 3. Running the Server & Client
+
+### 3.1 Start the Server
+Start the TCP lobby server (listens on port `5000` by default):
 ```bash
-java Server
-# Expected: Server is listening on port 5000
+java -cp bin server.Server
 ```
 
-### Run Client (repeat in multiple terminals)
+### 3.2 Start the Interactive CLI Client
+Open a separate terminal window and connect to the local server:
 ```bash
-java Client
-# Expected: Connected to server!
+java -cp bin server.Client
 ```
-
-### Stop Server
-Press `Ctrl+C` in server terminal. Note: no graceful shutdown at Level 2 — sockets are forcibly closed.
-
----
-
-## 2. Planned Deployment Stages
-
-| Level | Deployment Model | Technology |
-|-------|-----------------|-----------|
-| 4 | Maven build, JAR packaging | `mvn package` |
-| 6 | Config file, env vars | `.env` + `application.properties` |
-| 7 | PostgreSQL setup, schema migration | Flyway migrations |
-| 8 | SSL cert generation | OpenSSL + Java keystore |
-| 15 | Docker containerization | `Dockerfile` + `docker-compose.yml` |
-| 15 | Kubernetes deployment | `deployment.yaml` + `service.yaml` |
-| 15 | CI/CD pipeline | GitHub Actions |
-
----
-
-## 3. Docker Deployment Plan (Level 15)
-
-```dockerfile
-# Dockerfile (planned)
-FROM eclipse-temurin:21-jre-alpine
-WORKDIR /app
-COPY target/server.jar server.jar
-EXPOSE 5000
-ENTRYPOINT ["java", "-jar", "server.jar"]
-```
-
-```yaml
-# docker-compose.yml (planned)
-version: '3.9'
-services:
-  server:
-    build: .
-    ports:
-      - "5000:5000"
-    environment:
-      - SERVER_PORT=5000
-      - DB_URL=jdbc:postgresql://db:5432/serverdb
-    depends_on:
-      - db
-
-  db:
-    image: postgres:16
-    environment:
-      POSTGRES_DB: serverdb
-      POSTGRES_USER: serveruser
-      POSTGRES_PASSWORD: securepassword
+Alternatively, you can connect using raw socket CLI tools:
+```bash
+telnet localhost 5000
 ```
 
 ---
 
-## 4. Environment Variables (Level 4+)
+## 4. Running the Test Suite
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SERVER_PORT` | `5000` | TCP port to bind |
-| `MAX_CLIENTS` | `200` | Thread pool size |
-| `DB_URL` | — | PostgreSQL JDBC URL |
-| `DB_USER` | — | Database username |
-| `DB_PASS` | — | Database password |
-| `JWT_SECRET` | — | HMAC key for JWT signing |
-| `LOG_LEVEL` | `INFO` | Logging verbosity |
+### 4.1 Integration & Load Tests
+Compile and run the Java integration and load test harnesses:
+```bash
+# Compile tests
+javac -cp bin -d bin tests/*.java
+
+# Run integration tests
+java -cp bin tests.SystemIntegrationTest
+
+# Run load/stress tests
+java -cp bin tests.LoadTest
+```
+
+### 4.2 End-to-End (E2E) Verification Script
+To run the automated PowerShell end-to-end lobby script:
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/e2e-lobby-test.ps1
+```
 
 ---
 
-## 5. Monitoring Plan (Level 15)
+## 5. Logs & Observability
+All server executions output structured concurrent logs into the `logs/` directory:
+- `logs/Server.log`: Server lifecycle state transitions, connections, and shutdown sequences.
+- `logs/ClientHandler.log`: Per-session command transactions and socket-level write/read logging.
+- `logs/Registry.log`: Registry mutation events, registrations, and player evictions.
+- `logs/Client.log`: Client-side log outputs.
 
-| Tool | Purpose |
-|------|---------|
-| Prometheus | Metrics: connections/sec, active threads, error rate |
-| Grafana | Dashboards for all server metrics |
-| ELK Stack | Centralized log aggregation |
-| GitHub Actions | CI: build → test → deploy on push |
+---
+
+## 6. Shutdown Procedure
+To terminate the server cleanly, send a SIGINT signal (e.g. press `Ctrl+C` in the server terminal). 
+
+AegisCore will intercept this signal using a JVM shutdown hook and execute a **3-Phase Graceful Shutdown**:
+1. Close the master `ServerSocket` to reject new connections.
+2. Broadcast a shutdown warning and disconnect all active players cleanly.
+3. Terminate countdown timer executor threads and flush all logs.
+
+---
+
+## 7. Future Deployment Path
+Planned enhancements for enterprise production setups include:
+- Containerization using Docker to pack the lobby server into lightweight alpine-based layers.
+- Kubernetes deployment blueprints for scaling lobby node pods.
+- CI/CD integration with GitHub Actions for automated lint, build, test, and container registry publishing.

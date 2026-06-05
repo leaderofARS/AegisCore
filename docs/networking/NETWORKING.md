@@ -1,93 +1,88 @@
-# Networking Documentation
+# AegisCore Networking Specification
 
-**Project:** Distributed Multithreaded Secure Server Platform
-**Version:** 0.2.0 | **Date:** 2026-05-18
-
----
-
-## 1. Protocol Specification
-
-| Property | Value |
-|----------|-------|
-| Transport | TCP |
-| Server Port | 5000 |
-| Encoding | UTF-8 |
-| Message Delimiter | Newline (`\n`) |
-| I/O Abstraction | `BufferedReader` / `PrintWriter` (blocking) |
-| Connection Type | Persistent, stateful |
-
-**Why TCP over UDP?** TCP guarantees ordered, reliable delivery — essential for authentication commands and session state. A dropped login packet cannot be silently ignored.
+This document details the networking protocol, connection lifecycle, and message framing specs implemented in the **AegisCore** Game Lobby Server.
 
 ---
 
-## 2. Connection Lifecycle
+## 1. Network Protocol Specifications
 
-```
-CLIENT                              SERVER
-  │  ── TCP SYN ──────────────────►  │   1. Client initiates handshake
-  │  ◄── TCP SYN-ACK ─────────────  │   2. Server acknowledges
-  │  ── TCP ACK ──────────────────►  │   3. Connection established
-  │                                   │   4. accept() returns → ClientHandler thread born
-  │  ◄── "Connected to server!" ───  │   5. Welcome message sent
-  │  ── "hello" ───────────────────►  │   6. Client sends message
-  │  ◄── "Server received: hello" ─  │   7. Server echoes response
-  │  ── "exit" ───────────────────►  │   8. Termination signal
-  │  ◄── TCP FIN ──────────────────  │   9. Server closes socket → thread dies
-```
+| Protocol Detail | Value | Description |
+|---|---|---|
+| **Layer** | Transport Layer | Operates directly over raw TCP sockets. |
+| **Default Port** | `5000` | Configurable system listener port. |
+| **Character Set** | UTF-8 | All messages are parsed as UTF-8 encoded text. |
+| **Framing Delimiter** | Newline (`\n`) | Line-oriented protocol. A message is exactly one line. |
+| **I/O Model** | Blocking I/O | The server reads inputs line-by-line using blocking stream operations. |
 
 ---
 
-## 3. Message Format
+## 2. Connection Handshake Lifecycle
 
-**Current (Level 1–2):** Raw UTF-8 text lines terminated by `\n`
+When a client establishes a socket connection to port `5000`, the server initiates a handshake sequence:
+
 ```
-hello world
-exit
+Client                                                  Server
+  │                                                       │
+  │────────────────── TCP Handshake ─────────────────────>│ (Socket accepted)
+  │                                                       │
+  |<─────────────── [SERVER] Welcomes... ─────────────────│ (Welcome header sent)
+  │                                                       │
+  │                                                       │
+  │─────────────────── NAME Kirito ──────────────────────>│ (Name registration)
+  │                                                       │
+  |<───────────── [SERVER] Welcome... Kirito! ────────────│ (State: IN_LOBBY)
 ```
 
-**Target (Level 5 — Command Engine):**
-```
-/command [arg1] [arg2]
-/login alice password123
-/msg bob hey there
-/list
-```
-
-**Target (Level 8+ — Authenticated):**
-```
-[JWT_TOKEN] /command [args]
-```
+1. **TCP Connection:** The client opens a socket connection to port 5000.
+2. **Server Welcome Response:** The server immediately sends a welcome header:
+   `[SERVER] Welcome to AegisCore Game Lobby Server`
+3. **Name Registration:** The client must issue a `NAME <username>` command.
+4. **Lobby Entry:** On success, the server responds with a verification message, enabling access to lobby commands (e.g. `CREATE`, `JOIN`, `LIST`, `QUEUE`).
 
 ---
 
-## 4. Port Configuration
+## 3. Message Framing & Syntax
 
-| Stage | Port | Notes |
-|-------|------|-------|
-| Level 1–3 | 5000 (hardcoded) | Dev only |
-| Level 4+ | Env var `SERVER_PORT` | Configurable |
-| Level 8 | 5443 (TLS) | Encrypted |
-| Level 15 | K8s LoadBalancer | Cloud-native |
+### 3.1 Client Commands
+All client commands must follow this format:
+```
+<COMMAND> [arguments...]\n
+```
+- **Delimiter:** Exactly one trailing `\n`.
+- **Command Name:** Always uppercase (e.g., `NAME`, `CREATE`, `JOIN`, `READY`).
+- **Whitespace:** Commands and arguments are separated by spaces. Arguments containing spaces are not permitted unless handled by command type parameters (e.g., `CHAT`).
 
----
-
-## 5. Known Networking Issues
-
-| Issue | Impact | Fix Level |
-|-------|--------|-----------|
-| No `SO_TIMEOUT` — `readLine()` blocks forever | Zombie threads | Level 4 |
-| Default backlog of 50 | Dropped connections under burst | Level 6 |
-| Hardcoded `localhost` in `Client.java` | Not deployable | Level 4 |
-| No SSL/TLS — plaintext on wire | Trivially interceptable | Level 8 |
+*Note: The protocol does not use slashes (e.g., `/command` is invalid; use `COMMAND`).*
 
 ---
 
-## 6. Future Networking Layers
+## 4. Server Response Framing
 
-| Level | Technology | Change |
-|-------|-----------|--------|
-| 8 | `SSLSocket` | Encrypted transport |
-| 10 | WebSocket JSR-356 | Browser full-duplex |
-| 11 | Java NIO `Selector`/`Channel` | Non-blocking event-driven |
-| 12 | Apache Kafka | Distributed event streaming |
-| 14 | gRPC | Type-safe inter-service RPC |
+All responses sent by the server start with a specific system prefix indicator to help clients parse events:
+
+- **`[SERVER]`**
+  System confirmations, configuration updates, and lobby telemetry details.
+  *Example:* `[SERVER] Joined room: r-001`
+- **`[ROOM]`**
+  Room-scoped updates and broadcasts (e.g. chat messages, players joining/leaving).
+  *Example:* `[ROOM] Kirito: Hello everyone!`
+- **`[READY]`**
+  State changes, countdown markers, and ready status confirmations.
+  *Example:* `[READY] All players ready! Starting in 5...`
+- **`[MATCH]`**
+  Matchmaking state updates.
+  *Example:* `[MATCH] Entered matchmaking queue.`
+- **`[INFO]`**
+  System informational logs.
+  *Example:* `[INFO] ⚔ Game session started! Good luck.`
+- **`[ERROR]`**
+  Command syntax violations, state errors, or invalid actions.
+  *Example:* `[ERROR] Username is already taken.`
+
+---
+
+## 5. Future Network Architecture
+
+Future releases plan to introduce:
+- A **WebSocket adapter** to bridge HTML5 web clients to the TCP lobby.
+- A **Java NIO Selector engine** to run the socket lifecycle asynchronously under a single thread, enabling the server to scale past 10,000 concurrent socket connections.
