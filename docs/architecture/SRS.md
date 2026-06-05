@@ -1,245 +1,62 @@
 # Software Requirements Specification (SRS)
 
-**Project:** Distributed Multithreaded Secure Server Platform
-**Document Version:** 1.0
-**System Version:** 0.2.0
-**Date:** 2026-05-18
-**Stage:** Level 2 — Multithreading
-
----
-
 ## 1. Introduction
 
 ### 1.1 Purpose
+This document specifies the software requirements for **AegisCore**, a high-performance, multithreaded TCP game lobby server written in Java. AegisCore provides player session management, room management, ready checks, and matchmaking queues for multiplayer game backends.
 
-The purpose of this system is to develop a scalable, multithreaded TCP communication server capable of handling concurrent client sessions, processing structured commands, persisting user data, and eventually operating as a distributed, fault-tolerant backend infrastructure suitable for banking, trading, gaming, IoT, and cybersecurity applications.
-
-This SRS defines the complete requirements — functional, non-functional, and constraint-based — across all 17 development levels of the project.
-
-### 1.2 Scope
-
-The system encompasses:
-- A TCP socket server accepting concurrent client connections
-- A command-processing engine interpreting structured client messages
-- A user authentication and session management subsystem
-- A database persistence layer
-- An event-driven communication backbone
-- A distributed clustering layer
-- A security enforcement layer (encryption, hashing, authorization)
-
-**Out of Scope (current level):**
-- WebSocket support (Level 10)
-- Distributed consensus (Level 12)
-- AI/ML integration (Level 17)
-
-### 1.3 Definitions
-
-| Term | Definition |
-|------|-----------|
-| Client | A TCP socket connection established by an end-user process |
-| ClientHandler | A server-side thread responsible for one client's lifecycle |
-| Session | An authenticated, stateful association between a user and the server |
-| Command | A structured message from client to server, prefixed with `/` |
-| Thread Pool | A bounded set of reusable worker threads managed by `ExecutorService` |
-| NIO | Java Non-Blocking I/O — `java.nio` package using `Selector`, `Channel`, `Buffer` |
+### 1.2 System Scope
+The system includes:
+- A TCP socket server accepting concurrent client sessions.
+- A command parser and router dispatching line-oriented commands.
+- A player registry managing active sessions and identification.
+- A room registry managing room creation, player slot limits, listings, and room states.
+- A matchmaking queue managing auto-pairing of players.
+- A thread-safe file logging engine.
 
 ---
 
 ## 2. Functional Requirements
 
-### FR-1: Multi-Client Concurrency
-The server SHALL accept and maintain multiple simultaneous client connections without serializing them.
+### 2.1 Player Session Management
+- **FR-1.1:** The system shall accept incoming TCP connections on port 5000.
+- **FR-1.2:** The system shall require players to register a unique display name using the `NAME` command before allowing other commands.
+- **FR-1.3:** The system shall register named players in a global registry and evict them cleanly on client disconnect or when the `QUIT` command is issued.
 
-**Acceptance Criteria:**
-- 10 clients connected simultaneously, each sending messages independently
-- No client blocks another client's communication
+### 2.2 Room Management
+- **FR-2.1:** The system shall allow players in the lobby to create rooms using the `CREATE` command, specifying a room name and optional player capacity (slots).
+- **FR-2.2:** The system shall assign a unique room ID (e.g., `r-001`) to each created room.
+- **FR-2.3:** The system shall allow players to join open rooms by ID using the `JOIN` command, list joinable rooms using the `LIST` command, and leave rooms using the `LEAVE` command.
+- **FR-2.4:** The system shall automatically destroy rooms when the last occupying player leaves.
 
-**Status:** ✅ Met (Level 2 — thread per client)
+### 2.3 Ready-Check & Countdown
+- **FR-3.1:** The system shall allow players inside a room to signal readiness using the `READY` command or retract it using the `UNREADY` command.
+- **FR-3.2:** When all players in a room are marked as ready, the system shall initiate a 5-second countdown.
+- **FR-3.3:** If any player issues `UNREADY` or leaves the room during the countdown, the system shall cancel the countdown immediately.
+- **FR-3.4:** If the countdown completes successfully, the system shall transition the room to `IN_PROGRESS` and notify all occupants.
 
----
+### 2.4 Automatic Matchmaking
+- **FR-4.1:** The system shall allow players to enter the matchmaking queue using the `QUEUE` command and leave it using `DEQUEUE`.
+- **FR-4.2:** A background matchmaking thread shall poll queued players and automatically group them into rooms once a full match size is satisfied.
 
-### FR-2: Bidirectional Communication
-Each connected client SHALL be able to send messages to and receive responses from the server.
+### 2.5 Room Chat Broadcast
+- **FR-5.1:** The system shall allow players inside a room to send messages to all other room occupants using the `CHAT` command.
 
-**Acceptance Criteria:**
-- Client sends text → server echoes it back with prefix "Server received:"
-- Response arrives on same connection
-
-**Status:** ✅ Met
-
----
-
-### FR-3: Clean Session Termination
-The server SHALL gracefully close client connections when the client sends the `exit` command.
-
-**Acceptance Criteria:**
-- `exit` message → server closes socket → thread terminates
-- Server continues accepting other clients after disconnect
-
-**Status:** ✅ Met
-
----
-
-### FR-4: Shared Client Registry
-The server SHALL maintain a thread-safe registry of all currently connected clients.
-
-**Acceptance Criteria:**
-- Any thread can safely read the client list
-- Concurrent additions/removals do not corrupt the list
-
-**Status:** ⏳ Level 3
-
----
-
-### FR-5: Global Broadcast
-The server SHALL allow a message from one client to be delivered to all other connected clients.
-
-**Acceptance Criteria:**
-- Client A sends message → all other connected clients receive it
-- No message loss under concurrent access
-
-**Status:** ⏳ Level 3
-
----
-
-### FR-6: Command Processing
-The server SHALL parse and dispatch structured commands from clients.
-
-| Command | Action |
-|---------|--------|
-| `/login <user> <pass>` | Authenticate user |
-| `/register <user> <pass>` | Create new account |
-| `/msg <target> <text>` | Send private message |
-| `/list` | Return list of online users |
-| `/quit` | Disconnect cleanly |
-
-**Status:** ⏳ Level 5
-
----
-
-### FR-7: User Authentication
-The server SHALL authenticate users against a persistent store using hashed credentials.
-
-**Acceptance Criteria:**
-- Passwords stored as BCrypt hashes (never plaintext)
-- Failed login returns `ERROR: Invalid credentials`
-- Successful login returns session token
-
-**Status:** ⏳ Level 8
-
----
-
-### FR-8: Message Persistence
-The server SHALL persist all messages to a relational database.
-
-**Acceptance Criteria:**
-- Messages survive server restart
-- Messages queryable by sender, receiver, and timestamp
-
-**Status:** ⏳ Level 7
-
----
-
-### FR-9: Session Token Validation
-The server SHALL validate JWT session tokens on every command that requires authentication.
-
-**Acceptance Criteria:**
-- Expired tokens rejected with `ERROR: Session expired`
-- Tampered tokens rejected with `ERROR: Invalid token`
-
-**Status:** ⏳ Level 8
+### 2.6 Server Statistics & Telemetry
+- **FR-6.1:** The system shall aggregate server metrics (active sessions, lifetime accepted connections, relayed messages, and socket byte throughput).
+- **FR-6.2:** The system shall allow players to query these metrics using the `STATS` command.
 
 ---
 
 ## 3. Non-Functional Requirements
 
-### NFR-1: Concurrency
-The server SHOULD support a minimum of **1,000 concurrent clients** without crashing.
+### 3.1 Performance & Scalability
+- **NFR-1.1:** The server socket loop shall accept connections in a non-blocking queue (OS level) and hand off to handler threads immediately.
+- **NFR-1.2:** Intrinsic locks on socket output streams shall serialize writes to prevent byte interleaving without bottlenecking independent clients.
 
-**Current state:** ~200–500 (limited by OS thread count)
-**Target state:** 1,000+ via thread pool (Level 6), 10,000+ via NIO (Level 11)
+### 3.2 Reliability & Fault Tolerance
+- **NFR-2.1:** The server shall isolate network exceptions thrown by a client so that a single client disconnect during a broadcast loop does not abort transmissions to other clients or crash the server.
+- **NFR-2.2:** The player registry shall remain consistent, evicting sockets cleanly and avoiding zombie threads.
 
----
-
-### NFR-2: Response Time
-Average server response time per request SHOULD be **< 100ms** under normal load.
-
-**Baseline:** Sub-millisecond at current scale (no DB, no auth)
-**Target:** < 100ms with DB + auth (Level 8)
-
----
-
-### NFR-3: Availability
-The server MUST remain operational after individual client connection failures.
-
-**Current state:** ✅ `IOException` per client does not crash server
-**Target state:** Server survives own internal errors with auto-restart (Level 13)
-
----
-
-### NFR-4: Security
-Passwords MUST NOT be stored in plaintext. Communications SHOULD be encrypted in transit.
-
-**Current state:** ❌ No auth layer exists
-**Target state:** BCrypt hashing (Level 8), SSL/TLS transport (Level 8)
-
----
-
-### NFR-5: Scalability
-The system architecture MUST support horizontal scaling across multiple server nodes.
-
-**Current state:** Single-node only
-**Target state:** Distributed cluster with Redis/Kafka (Level 12)
-
----
-
-### NFR-6: Maintainability
-The codebase MUST follow layered architecture principles. No business logic in socket handlers.
-
-**Current state:** ⚠️ All logic in `ClientHandler` (acceptable at Level 2)
-**Target state:** Layered architecture enforced at Level 4
-
----
-
-### NFR-7: Observability
-The server SHOULD emit structured logs for all connection events, command executions, and errors.
-
-**Current state:** `System.out.println` only
-**Target state:** SLF4J + Logback with structured JSON logs (Level 4)
-
----
-
-## 4. Constraints
-
-| Constraint | Detail |
-|-----------|--------|
-| Language | Java 21 LTS |
-| Build | Standard `javac` (Maven/Gradle at Level 4) |
-| Database | PostgreSQL (JDBC, no ORM until Level 7) |
-| Protocol | TCP; no UDP, no HTTP at base layer |
-| Port | 5000 (configurable via environment variable in Level 4) |
-| Encoding | UTF-8 |
-| Auth | No external OAuth; custom JWT implementation |
-| OS | Cross-platform (Windows, Linux, macOS) |
-
----
-
-## 5. Assumptions
-
-- Clients communicate using line-terminated UTF-8 text (`\n` delimiter)
-- Server runs in a trusted network environment at Level 1–7
-- SSL/TLS added at Level 8 when external exposure is assumed
-- Database is local PostgreSQL instance until Level 15 (cloud DB)
-
----
-
-## 6. Risk Register
-
-| Risk | Probability | Impact | Mitigation |
-|------|------------|--------|-----------|
-| Thread explosion under load | HIGH | Server crash | Thread pool at Level 6 |
-| Race condition in client registry | HIGH | Data corruption | Synchronized collections at Level 3 |
-| SQL injection via command input | HIGH | DB breach | Prepared statements at Level 7 |
-| Plaintext password storage | HIGH | Credential exposure | BCrypt at Level 8 |
-| Single point of failure | MEDIUM | Full outage | Distributed cluster at Level 12 |
-| Memory leak from unclosed sockets | MEDIUM | OOM crash | try-with-resources + Level 13 |
+### 3.3 Observability
+- **NFR-3.1:** The system shall output thread-safe logs to files in a `logs/` directory (`Server.log`, `ClientHandler.log`, `Registry.log`, `Client.log`).

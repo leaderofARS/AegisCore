@@ -59,7 +59,7 @@ public class Server {
             serverSocket = new ServerSocket(PORT, 500);
             Logger.logServer("╔══════════════════════════════════════════════╗");
             Logger.logServer("║   AegisCore Game Lobby Server                ║");
-            Logger.logServer("║   Listening on port " + PORT + "                       ║");
+            Logger.logServer("║   Listening on port " + PORT + "                      ║");
             Logger.logServer("╚══════════════════════════════════════════════╝");
 
             while (true) {

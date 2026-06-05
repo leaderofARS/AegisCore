@@ -1,239 +1,97 @@
-# System Architecture Document
+# AegisCore System Architecture
 
-**Project:** Distributed Multithreaded Secure Server
-**Version:** 0.2.0
-**Stage:** Level 2 — Multithreading
-**Last Updated:** 2026-05-18
+This document describes the high-level architecture of the **AegisCore** Game Lobby Server, detailing its package layout, component interactions, data flows, and concurrency models.
 
 ---
 
-## 1. Purpose
+## 1. Modular Package Structure
 
-This document describes the system architecture of the server platform at its current development stage and projects forward to the target architecture at Level 4+. It is the authoritative reference for understanding how components interact, how data flows, and how the system is designed to scale.
-
----
-
-## 2. High-Level Architecture
-
-### Current (Level 2)
+AegisCore is decomposed into 6 specialized Java packages:
 
 ```
-┌──────────────────────────────────────────────┐
-│                   CLIENTS                    │
-│  [Client.java]  [Client.java]  [Client.java] │
-│       │               │               │      │
-└───────┼───────────────┼───────────────┼──────┘
-        │  TCP/IP       │  TCP/IP       │ TCP/IP
-        │  Port 5000    │  Port 5000    │ Port 5000
-┌───────▼───────────────▼───────────────▼──────┐
-│              SERVER (Server.java)            │
-│  ServerSocket(5000)                          │
-│  accept() ← blocks until connection arrives  │
-│       │               │               │      │
-│  Thread-1         Thread-2         Thread-N  │
-│  [ClientHandler]  [ClientHandler]  [ClientHandler] │
-│       │               │               │      │
-│  readLine()       readLine()       readLine() │
-│  println()        println()        println()  │
-└──────────────────────────────────────────────┘
-```
-
-### Target (Level 4+)
-
-```
-┌─────────────────────────────────────────────────────┐
-│                     CLIENT TIER                     │
-└──────────────────────┬──────────────────────────────┘
-                       │ TCP / WebSocket / gRPC
-┌──────────────────────▼──────────────────────────────┐
-│                  NETWORK LAYER                      │
-│  ConnectionManager  │  SocketAcceptor               │
-│  ThreadPool (ExecutorService, Level 6)              │
-└──────────────────────┬──────────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────────┐
-│                  COMMAND LAYER                      │
-│  CommandParser  │  CommandRouter  │  CommandRegistry │
-│  /login  /msg  /list  /quit  (Level 5)              │
-└──────────────────────┬──────────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────────┐
-│                  SERVICE LAYER                      │
-│  AuthService  │  MessageService  │  SessionService   │
-└──────────┬───────────────────────────┬──────────────┘
-           │                           │
-┌──────────▼──────────┐  ┌────────────▼──────────────┐
-│  DATABASE LAYER     │  │  CACHE LAYER               │
-│  JDBC / PostgreSQL  │  │  Redis (Level 12)          │
-│  HikariCP pool      │  └───────────────────────────┘
-└─────────────────────┘
+src/
+├── server/
+│   ├── Server.java          # Server entry point, TCP accept loop, graceful shutdown
+│   ├── ClientHandler.java   # Dedicated client thread, socket I/O serializer
+│   └── Client.java          # Diagnostic CLI client
+├── player/
+│   ├── Player.java          # Player session data, ID, name, status, current room
+│   ├── PlayerStatus.java    # Player session state enum
+│   └── PlayerRegistry.java  # Singleton registry managing all connected players
+├── room/
+│   ├── Room.java            # Room lobby state, slots, ready status, broadcast logic
+│   ├── RoomState.java       # Room status state machine
+│   └── RoomRegistry.java    # Singleton registry managing all active rooms
+├── matchmaking/
+│   ├── MatchConfig.java     # Match size configurations
+│   └── MatchmakingQueue.java # Daemon thread matching players from queue
+├── protocol/
+│   ├── CommandType.java     # Protocol command specifications
+│   ├── CommandContext.java  # Immutable execution context
+│   └── CommandRouter.java   # Command parser and executor
+└── core/
+    ├── Logger.java          # Concurrently-safe logging system
+    └── ServerStats.java     # Immutable telemetry snapshot
 ```
 
 ---
 
-## 3. Component Descriptions
+## 2. Component Interactions
 
-### Server.java
-**Role:** Entry point. Binds to port 5000. Runs the accept loop.
-
-**Responsibilities:**
-- Create and bind `ServerSocket`
-- Block on `accept()` awaiting client connections
-- For each accepted connection, create and start a `ClientHandler` thread
-
-**Current limitation:** The accept loop runs on the main thread. If it crashes, the entire server crashes. A supervisor/restart mechanism will be added at Level 13.
-
----
-
-### ClientHandler.java
-**Role:** Manages the full lifecycle of a single client connection.
-
-**Responsibilities:**
-- Wrap socket streams in `BufferedReader` / `PrintWriter`
-- Send welcome acknowledgement to client
-- Loop: read message → process → respond
-- Detect `exit` command and terminate cleanly
-- Close socket on completion or error
-
-**Implements:** `Runnable` (via `extends Thread`)
-
-**Current limitation:** Each `ClientHandler` knows nothing about other clients. There is no shared registry. Broadcast and global state are deferred to Level 3.
-
----
-
-### Client.java
-**Role:** Test client used for manual and automated testing.
-
-**Responsibilities:**
-- Establish TCP connection to `localhost:5000`
-- Read server welcome message
-- Enter interactive send/receive loop
-- Terminate on `exit` command
-
----
-
-## 4. Data Flow
-
-### Message Flow (Current)
+The following ASCII diagram illustrates how core server components interact during a session:
 
 ```
-Client Terminal
-    │
-    │ user types: "hello"
-    ▼
-Client.java
-    │ output.println("hello")
-    ▼
-TCP Socket Stream
-    │
-    ▼
-ClientHandler.java (running on Thread-N)
-    │ input.readLine() returns "hello"
-    │ System.out.println("Client says: hello")
-    │ output.println("Server received: hello")
-    ▼
-TCP Socket Stream (reverse direction)
-    │
-    ▼
-Client.java
-    │ input.readLine() returns "Server received: hello"
-    │ System.out.println("Server received: hello")
-    ▼
-Client Terminal displays response
+                  ┌──────────────┐
+                  │ Player Socket│
+                  └──────┬───────┘
+                         │ TCP Connection
+                         ▼
+                  ┌──────────────┐
+                  │    Server    │
+                  └──────┬───────┘
+                         │ Spawns
+                         ▼
+                  ┌──────────────┐
+                  │ ClientHandler│◄──────────────┐
+                  └──────┬───────┘               │
+                         │ Dispatch              │
+                         ▼                       │
+                  ┌──────────────┐               │ Broadcast
+                  │ CommandRouter│               │
+                  └──────┬───────┘               │
+             ┌───────────┼───────────┐           │
+             ▼           ▼           ▼           │
+     ┌──────────────┐┌───────────┐┌──────────────┤
+     │PlayerRegistry││RoomRegistry││     Room     │
+     └──────────────┘└───────────┘└──────────────┘
 ```
 
 ---
 
-## 5. Threading Architecture
+## 3. Data Flow Scenario (Typical Session)
 
-### Current Model: One Thread Per Client
-
-| Property | Value |
-|----------|-------|
-| Model | `new Thread(clientHandler).start()` |
-| Thread count | Equals number of connected clients |
-| Max practical clients | ~200–500 (OS-dependent) |
-| Memory per thread | ~1MB JVM stack |
-| Thread lifecycle | Born on connect, dies on disconnect |
-
-### Thread State Diagram
-
-```
-       Client connects
-            │
-            ▼
-       [NEW thread created]
-            │
-            ▼
-       [RUNNABLE — run() executing]
-            │
-    ┌───────┴────────────┐
-    │                    │
-    ▼                    ▼
-[BLOCKED on        [Running — processing
- readLine()]        message]
-    │
-    ▼
-[client sends "exit" or disconnects]
-    │
-    ▼
-[TERMINATED — socket closed, thread ends]
-```
-
-### Future Model: ExecutorService (Level 6)
-
-```java
-ExecutorService pool = Executors.newFixedThreadPool(100);
-
-while (true) {
-    Socket client = serverSocket.accept();
-    pool.submit(new ClientHandler(client));
-    // No new thread created — reuses thread from pool
-}
-```
-
-### Final Model: NIO Event Loop (Level 11)
-
-```
-Selector (single thread monitors ALL channels)
-    │
-    ├─ Channel 1 ready → process data → return
-    ├─ Channel 2 ready → process data → return
-    └─ Channel N ready → process data → return
-
-No blocking. No thread per client. Handles 10,000+ clients.
-```
+1. **Connection:** Client establishes a TCP connection to port 5000. `Server` accepts the connection and spawns a new thread executing `ClientHandler`.
+2. **Identification:** The client sends `NAME Kirito`. `CommandRouter` updates the player's name and changes their state in the `PlayerRegistry` from `CONNECTED` to `IN_LOBBY`.
+3. **Room Creation:** The client sends `CREATE Aincrad-Floor1 4`. `CommandRouter` invokes `RoomRegistry` to instantiate a new `Room` object, adds the player to the room, and changes their status to `IN_ROOM`.
+4. **Room Invitation:** A second client connects, sets their name to `Asuna`, and sends `JOIN r-001`. They are added to the room, and their status updates to `IN_ROOM`.
+5. **Readiness & Countdown:** Both players send `READY`. Once all slot spaces (or all joined players when full) confirm readiness, `Room` schedules a 5-second countdown timer.
+6. **Game Start:** When the countdown reaches 0, the room state transitions to `IN_PROGRESS`, players transition to `IN_GAME`, and the game world session is initiated.
 
 ---
 
-## 6. Scalability Analysis
+## 4. Threading Model
 
-| Stage | Model | Max Clients | Memory Cost |
-|-------|-------|-------------|-------------|
-| Level 2 (current) | Thread per client | ~200–500 | 1MB × N threads |
-| Level 6 | Thread pool (fixed) | ~1,000–5,000 | 1MB × pool size |
-| Level 11 | NIO event loop | 10,000–100,000 | ~KB per connection |
-| Level 12 | Distributed cluster | Millions | Horizontally scaled |
+AegisCore uses a multi-threaded architecture optimized for CPU scheduling and low latency:
 
----
-
-## 7. Error Handling Strategy
-
-| Scenario | Current Behavior | Target Behavior |
-|----------|-----------------|-----------------|
-| Client crash mid-session | `IOException` printed, thread dies | Log + clean registry removal (Level 3) |
-| Server `accept()` error | Server crashes | Retry loop with backoff (Level 13) |
-| Invalid client message | Echo'd back as-is | Validated and rejected (Level 5) |
-| OutOfMemory from thread explosion | JVM crash | Thread pool cap enforced (Level 6) |
+- **Client Threads:** Every connected client socket is assigned a dedicated thread running inside `ClientHandler`. This thread blocks on `BufferedReader.readLine()` waiting for client network packets.
+- **Matchmaking Daemon Thread:** A dedicated daemon thread runs continuously within `MatchmakingQueue` to poll queued players, check compatibility constraints, and group them into rooms.
+- **Countdown Scheduler:** A shared daemon `ScheduledExecutorService` handles asynchronous game start countdown triggers. This prevents client threads from blocking while waiting for timers.
 
 ---
 
-## 8. Future Architecture Decision Points
+## 5. Shared State Registry Singletons
 
-| Decision | Options | Planned Choice |
-|----------|---------|---------------|
-| I/O model | Blocking, NIO, Netty | NIO at Level 11 |
-| Thread management | new Thread(), pool, virtual threads (Loom) | Pool L6, Loom consideration L11 |
-| Inter-service comms | REST, gRPC | gRPC at Level 14 |
-| Message broker | Kafka, RabbitMQ | Kafka at Level 12 |
-| Database ORM | Raw JDBC, Hibernate | Hibernate at Level 7 |
+To coordinate state across multiple independent client threads, AegisCore employs two global singleton registries:
+
+- **PlayerRegistry:** Built on top of a `ConcurrentHashMap<String, Player>`. It tracks all active connections, mapping client session IDs to player objects. It uses lock-free reads and writes for thread-safe session validation.
+- **RoomRegistry:** Built on top of a `ConcurrentHashMap<String, Room>`. It tracks active rooms, handles listings, cleans up empty rooms, and generates unique room identifiers (e.g. `r-001`).

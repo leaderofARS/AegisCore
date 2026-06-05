@@ -267,4 +267,4 @@ MIT — free to use in commercial and open-source projects.
 
 ---
 
-*Built with Java 21. Zero dependencies. Open to the metal.*
+*Built with Java 26. Zero dependencies. Open to the metal.*
