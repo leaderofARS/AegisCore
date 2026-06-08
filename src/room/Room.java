@@ -44,17 +44,20 @@ public class Room {
 
     private final String roomId;
     private final String name;
-    private final String ownerSessionId;
+    private volatile String ownerSessionId;
     private final int    maxPlayers;
+    private final RoomConfig config;
+    private final RoomEventLedger eventLedger;
 
     private final CopyOnWriteArrayList<Player> players  = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<Player> spectators = new CopyOnWriteArrayList<>();
     private final Set<String>                  readySet = ConcurrentHashMap.newKeySet();
 
     private volatile RoomState       state         = RoomState.WAITING;
     private volatile ScheduledFuture<?> countdownTask = null;
 
     /**
-     * Constructs a new room.
+     * Constructs a new room with a default configuration.
      *
      * @param roomId          unique server-assigned identifier (e.g., {@code r-001})
      * @param name            display name chosen by the owner
@@ -62,17 +65,36 @@ public class Room {
      * @param maxPlayers      maximum number of occupants; must be between 2 and 32
      */
     public Room(String roomId, String name, String ownerSessionId, int maxPlayers) {
+        this(roomId, name, ownerSessionId, maxPlayers, RoomConfig.defaultConfig());
+    }
+
+    /**
+     * Constructs a new room with a custom configuration.
+     *
+     * @param roomId          unique server-assigned identifier
+     * @param name            display name chosen by the owner
+     * @param ownerSessionId  session ID of the creating player
+     * @param maxPlayers      maximum number of occupants
+     * @param config          custom room configuration
+     */
+    public Room(String roomId, String name, String ownerSessionId, int maxPlayers, RoomConfig config) {
         this.roomId         = roomId;
         this.name           = name;
         this.ownerSessionId = ownerSessionId;
         this.maxPlayers     = maxPlayers;
+        this.config         = config;
+        this.eventLedger    = new RoomEventLedger(roomId);
+        this.eventLedger.record(RoomEvent.system(RoomEventType.ROOM_CREATED, "Room " + name + " created by owner " + ownerSessionId));
     }
 
     public String    getRoomId()        { return roomId; }
     public String    getName()          { return name; }
     public String    getOwnerSessionId(){ return ownerSessionId; }
+    public void      setOwnerSessionId(String ownerSessionId) { this.ownerSessionId = ownerSessionId; }
     public int       getMaxPlayers()    { return maxPlayers; }
     public RoomState getState()         { return state; }
+    public RoomConfig getConfig()       { return config; }
+    public RoomEventLedger getEventLedger() { return eventLedger; }
     public int       getPlayerCount()   { return players.size(); }
     public boolean   isFull()           { return players.size() >= maxPlayers; }
     public boolean   isReady(String sessionId) { return readySet.contains(sessionId); }
@@ -85,6 +107,13 @@ public class Room {
     public List<Player> getPlayers() { return Collections.unmodifiableList(players); }
 
     /**
+     * Returns an unmodifiable view of the current spectator list.
+     *
+     * @return live, snapshot-safe list of spectators
+     */
+    public List<Player> getSpectators() { return Collections.unmodifiableList(spectators); }
+
+    /**
      * Attempts to add a player to this room.
      *
      * @param player the player to add
@@ -95,6 +124,7 @@ public class Room {
         players.add(player);
         player.setCurrentRoomId(roomId);
         player.setStatus(PlayerStatus.IN_ROOM);
+        eventLedger.record(RoomEvent.of(RoomEventType.PLAYER_JOINED, player.getSessionId(), player.getDisplayName(), "Player joined"));
         return true;
     }
 
@@ -103,7 +133,7 @@ public class Room {
      *
      * <p>If the room is in {@code READY_CHECK} when a player leaves, the countdown
      * is cancelled and the room reverts to {@code WAITING}. If the leaving player
-     * is the owner, or if the room becomes empty, it is closed.
+     * is the owner, or if the room becomes empty, it is closed or owner is transferred.
      *
      * @param player the player to remove
      */
@@ -112,16 +142,50 @@ public class Room {
         readySet.remove(player.getSessionId());
         player.setCurrentRoomId(null);
         player.setStatus(PlayerStatus.IN_LOBBY);
+        eventLedger.record(RoomEvent.of(RoomEventType.PLAYER_LEFT, player.getSessionId(), player.getDisplayName(), "Player left"));
 
         if (state == RoomState.READY_CHECK) {
             cancelCountdown();
             state = RoomState.WAITING;
+            eventLedger.record(RoomEvent.system(RoomEventType.COUNTDOWN_CANCELLED, "Ready check cancelled — player left"));
             broadcast("[READY] Ready check cancelled — a player left the room.");
         }
 
-        if (players.isEmpty() || player.getSessionId().equals(ownerSessionId)) {
+        if (players.isEmpty()) {
             close();
+        } else if (player.getSessionId().equals(ownerSessionId)) {
+            Player nextOwner = players.get(0);
+            ownerSessionId = nextOwner.getSessionId();
+            eventLedger.record(RoomEvent.of(RoomEventType.OWNER_TRANSFERRED, nextOwner.getSessionId(), nextOwner.getDisplayName(), "Owner transferred to " + nextOwner.getLabel()));
+            broadcast("[ROOM] Owner left. " + nextOwner.getLabel() + " is now the room owner.");
         }
+    }
+
+    /**
+     * Attempts to add a spectator to this room.
+     *
+     * @param spectator the spectator to add
+     * @return {@code true} if added; {@code false} if the room is closed
+     */
+    public boolean addSpectator(Player spectator) {
+        if (state == RoomState.CLOSED) { return false; }
+        spectators.add(spectator);
+        spectator.setCurrentRoomId(roomId);
+        spectator.setStatus(PlayerStatus.SPECTATING);
+        eventLedger.record(RoomEvent.of(RoomEventType.SPECTATOR_JOINED, spectator.getSessionId(), spectator.getDisplayName(), "Spectator joined"));
+        return true;
+    }
+
+    /**
+     * Removes a spectator from the room.
+     *
+     * @param spectator the spectator to remove
+     */
+    public void removeSpectator(Player spectator) {
+        spectators.remove(spectator);
+        spectator.setCurrentRoomId(null);
+        spectator.setStatus(PlayerStatus.IN_LOBBY);
+        eventLedger.record(RoomEvent.of(RoomEventType.SPECTATOR_LEFT, spectator.getSessionId(), spectator.getDisplayName(), "Spectator left"));
     }
 
     /**
@@ -133,9 +197,11 @@ public class Room {
     public synchronized boolean setReady(Player player) {
         if (state != RoomState.WAITING && state != RoomState.READY_CHECK) { return false; }
         readySet.add(player.getSessionId());
+        eventLedger.record(RoomEvent.of(RoomEventType.PLAYER_READY, player.getSessionId(), player.getDisplayName(), "Player ready"));
         broadcast("[READY] " + player.getLabel() + " is ready  (" + readySet.size() + "/" + players.size() + ")");
 
-        if (readySet.size() == players.size() && players.size() > 1) {
+        int minReady = config.minReadyCount() > 0 ? config.minReadyCount() : players.size();
+        if (readySet.size() >= minReady && players.size() > 1) {
             startCountdown();
         }
         return true;
@@ -150,10 +216,12 @@ public class Room {
     public synchronized boolean setUnready(Player player) {
         if (state == RoomState.IN_PROGRESS || state == RoomState.CLOSED) { return false; }
         readySet.remove(player.getSessionId());
+        eventLedger.record(RoomEvent.of(RoomEventType.PLAYER_UNREADY, player.getSessionId(), player.getDisplayName(), "Player unready"));
 
         if (state == RoomState.READY_CHECK) {
             cancelCountdown();
             state = RoomState.WAITING;
+            eventLedger.record(RoomEvent.system(RoomEventType.COUNTDOWN_CANCELLED, "Ready check cancelled — player unready"));
             broadcast("[READY] " + player.getLabel() + " is not ready — countdown cancelled.");
         } else {
             broadcast("[READY] " + player.getLabel() + " is not ready  (" + readySet.size() + "/" + players.size() + ")");
@@ -162,12 +230,20 @@ public class Room {
     }
 
     /**
-     * Broadcasts a message to every player currently in this room.
+     * Broadcasts a message to every player and spectator currently in this room.
      *
      * @param message text to deliver; a newline is appended by each handler
      */
     public void broadcast(String message) {
         for (Player p : players) { p.send(message); }
+        for (Player p : spectators) { p.send(message); }
+    }
+
+    /**
+     * Records a chat message in the event ledger and broadcasts it.
+     */
+    public void recordChat(Player sender, String message) {
+        eventLedger.record(RoomEvent.of(RoomEventType.CHAT_MESSAGE, sender.getSessionId(), sender.getDisplayName(), message));
     }
 
     /**
@@ -178,13 +254,20 @@ public class Room {
         if (state == RoomState.CLOSED) { return; }
         state = RoomState.CLOSED;
         cancelCountdown();
+        eventLedger.record(RoomEvent.system(RoomEventType.ROOM_CLOSED, "Room closed"));
         broadcast("[INFO] Room " + name + " has been closed.");
         for (Player p : new ArrayList<>(players)) {
             p.setCurrentRoomId(null);
             p.setStatus(PlayerStatus.IN_LOBBY);
         }
+        for (Player p : new ArrayList<>(spectators)) {
+            p.setCurrentRoomId(null);
+            p.setStatus(PlayerStatus.IN_LOBBY);
+        }
         players.clear();
+        spectators.clear();
         readySet.clear();
+        eventLedger.writeToDisk();
         Logger.logRegistry("Room closed: " + roomId + " '" + name + "'");
     }
 
@@ -199,6 +282,7 @@ public class Room {
 
     private void startCountdown() {
         state = RoomState.READY_CHECK;
+        eventLedger.record(RoomEvent.system(RoomEventType.COUNTDOWN_STARTED, "Countdown started"));
         broadcast("[READY] All players ready! Starting in 5...");
 
         for (int sec = 4; sec >= 1; sec--) {
@@ -214,6 +298,7 @@ public class Room {
                 if (state != RoomState.READY_CHECK) { return; }
                 state = RoomState.IN_PROGRESS;
                 for (Player p : players) { p.setStatus(PlayerStatus.IN_GAME); }
+                eventLedger.record(RoomEvent.system(RoomEventType.MATCH_STARTED, "Match started"));
             }
             broadcast("[INFO] Game session started! Good luck.");
             Logger.logRegistry("Room " + roomId + " transitioned to IN_PROGRESS.");

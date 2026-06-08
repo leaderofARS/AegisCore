@@ -6,6 +6,12 @@ import matchmaking.MatchmakingQueue;
 import player.PlayerRegistry;
 import protocol.CommandRouter;
 import room.RoomRegistry;
+import admin.ServerConfig;
+import security.ConnectionGuard;
+import security.BanList;
+import network.ClientThreadPool;
+import network.HeartbeatManager;
+import core.MetricsServer;
 
 import java.io.*;
 import java.net.*;
@@ -27,49 +33,98 @@ import java.util.concurrent.CopyOnWriteArrayList;
  */
 public class Server {
 
-    private static final int  PORT                = 5000;
-    private static final long SHUTDOWN_TIMEOUT_MS = 5_000;
-
     private static ServerSocket      serverSocket;
     private static MatchmakingQueue  matchmakingQueue;
     private static Thread            matchmakingThread;
-
-    private static final List<Thread> clientThreads = new CopyOnWriteArrayList<>();
+    private static MetricsServer     metricsServer;
 
     /**
      * Starts the server: initialises all subsystems, registers a shutdown hook,
      * and enters the accept loop.
      *
-     * @param args command-line arguments; not used
+     * @param args command-line arguments; parses --port
      */
     public static void main(String[] args) {
+        // Parse --port command line arg to override default config
+        for (int i = 0; i < args.length; i++) {
+            if ("--port".equals(args[i]) && i + 1 < args.length) {
+                System.setProperty("port", args[i + 1]);
+            }
+        }
+
         Runtime.getRuntime().addShutdownHook(new Thread(Server::shutdown, "ShutdownHook"));
+
+        ServerConfig config = ServerConfig.getInstance();
+        Logger.logServer("Loaded server configuration: " + config);
 
         PlayerRegistry playerRegistry = PlayerRegistry.getInstance();
         RoomRegistry   roomRegistry   = RoomRegistry.getInstance();
-        MatchConfig    matchConfig    = MatchConfig.defaultConfig();
+        MatchConfig    matchConfig    = MatchConfig.defaultConfig(); // matchmaking config
+        
         matchmakingQueue = new MatchmakingQueue(matchConfig, roomRegistry);
         CommandRouter commandRouter  = new CommandRouter(playerRegistry, roomRegistry, matchmakingQueue);
 
+        // Start matchmaking daemon thread
         matchmakingThread = new Thread(matchmakingQueue, "MatchmakingQueue");
         matchmakingThread.setDaemon(true);
         matchmakingThread.start();
 
+        // Start heartbeat manager
+        HeartbeatManager.getInstance().start();
+
+        // Initialize and start metrics server if enabled
+        if (config.isMetricsEnabled()) {
+            core.MetricsCollector.getInstance().initialize(playerRegistry, roomRegistry, matchmakingQueue);
+            try {
+                metricsServer = MetricsServer.start(config.getMetricsPort(), core.MetricsCollector.getInstance());
+            } catch (IOException e) {
+                Logger.logServerError("Failed to start MetricsServer: " + e.getMessage());
+            }
+        }
+
+        int port = config.getPort();
         try {
-            serverSocket = new ServerSocket(PORT, 500);
+            serverSocket = new ServerSocket(port, 500);
             Logger.logServer("╔══════════════════════════════════════════════╗");
             Logger.logServer("║   AegisCore Game Lobby Server                ║");
-            Logger.logServer("║   Listening on port " + PORT + "                      ║");
+            Logger.logServer("║   Listening on port " + port + "                      ║");
             Logger.logServer("╚══════════════════════════════════════════════╝");
 
             while (true) {
                 Socket clientSocket = serverSocket.accept();
+                String ip = clientSocket.getInetAddress().getHostAddress();
+
+                // Check BanList before accepting connection
+                if (BanList.getInstance().isIpBanned(ip)) {
+                    Logger.logServer("Rejected banned connection from: " + ip);
+                    clientSocket.close();
+                    continue;
+                }
+
+                // Check ConnectionGuard limit
+                if (!ConnectionGuard.getInstance().allowConnection(ip)) {
+                    Logger.logServer("Connection guard rejected: " + ip + " (too many connections)");
+                    clientSocket.close();
+                    continue;
+                }
+
                 Logger.logServer("Player connected: " + clientSocket.getInetAddress().getHostAddress());
 
-                ClientHandler handler = new ClientHandler(clientSocket, playerRegistry, commandRouter);
-                Thread clientThread  = new Thread(handler, "Player-" + clientSocket.getPort());
-                clientThreads.add(clientThread);
-                clientThread.start();
+                // Create handler
+                ClientHandler handler = new ClientHandler(clientSocket, playerRegistry, commandRouter) {
+                    @Override
+                    public void run() {
+                        try {
+                            super.run();
+                        } finally {
+                            // Release IP connection slot
+                            ConnectionGuard.getInstance().releaseConnection(ip);
+                        }
+                    }
+                };
+
+                // Submit connection handling to virtual thread executor
+                ClientThreadPool.getInstance().submit(handler, "Player-" + clientSocket.getPort());
             }
 
         } catch (IOException e) {
@@ -101,24 +156,16 @@ public class Server {
         if (matchmakingQueue  != null) { matchmakingQueue.stop(); }
         if (matchmakingThread != null) { matchmakingThread.interrupt(); }
 
-        int total = clientThreads.size(), finished = 0, abandoned = 0;
-        Logger.logServer("Shutdown: waiting for " + total + " player thread(s) (timeout: " + SHUTDOWN_TIMEOUT_MS + "ms)...");
+        HeartbeatManager.getInstance().stop();
 
-        long deadline = System.currentTimeMillis() + SHUTDOWN_TIMEOUT_MS;
-        for (Thread t : clientThreads) {
-            if (!t.isAlive()) { finished++; continue; }
-            long remaining = deadline - System.currentTimeMillis();
-            if (remaining <= 0) { abandoned++; continue; }
-            try {
-                t.join(remaining);
-                if (!t.isAlive()) { finished++; } else { abandoned++; }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
+        if (metricsServer != null) {
+            metricsServer.stop();
         }
 
-        Logger.logServer("Shutdown complete — total: " + total +
-                         " | finished: " + finished + " | abandoned: " + abandoned);
+        // Shut down client thread pool
+        int timeoutSec = ServerConfig.getInstance().getHeartbeatTimeoutSeconds();
+        ClientThreadPool.getInstance().shutdown(timeoutSec * 1000L);
+
+        Logger.logServer("Shutdown complete.");
     }
 }

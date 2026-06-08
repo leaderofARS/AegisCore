@@ -33,8 +33,22 @@ public enum CommandType {
     DEQUEUE(0),
     /** {@code CHAT <message...>} — send a message to all players in your current room. */
     CHAT(1),
+    /** {@code WHISPER <player-name> <message...>} — send a private message to another player. */
+    WHISPER(2),
+    /** {@code INVITE <player-name>} — invite a player to join your current room. */
+    INVITE(1),
+    /** {@code ACCEPT <invite-id>} — accept a room invitation. */
+    ACCEPT(1),
+    /** {@code DECLINE <invite-id>} — decline a room invitation. */
+    DECLINE(1),
+    /** {@code SPECTATE <room-id>} — join a room as an observer. */
+    SPECTATE(1),
+    /** {@code ADMIN <sub-command...>} — administrative commands. */
+    ADMIN(1),
     /** {@code STATS} — display server statistics. */
     STATS(0),
+    /** {@code PONG} — keep-alive response from client. */
+    PONG(0),
     /** {@code QUIT} — cleanly disconnect from the server. */
     QUIT(0),
     /** Fallback for unrecognised input; always rejected with an error response. */

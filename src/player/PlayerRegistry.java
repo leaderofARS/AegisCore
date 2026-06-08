@@ -67,6 +67,38 @@ public class PlayerRegistry {
     public Collection<Player> getAllPlayers() { return players.values(); }
 
     /**
+     * Returns the player with the given display name, ignoring case, or null if not found.
+     *
+     * @param name display name to lookup
+     * @return matching Player, or null
+     */
+    public Player getPlayerByName(String name) {
+        if (name == null) return null;
+        for (Player p : players.values()) {
+            if (name.equalsIgnoreCase(p.getDisplayName())) {
+                return p;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Returns all players currently in the lobby who have not sent a command for more than 30 seconds.
+     *
+     * @return collection of idle players
+     */
+    public Collection<Player> getIdlePlayers() {
+        long limit = System.currentTimeMillis() - 30_000;
+        java.util.List<Player> idle = new java.util.ArrayList<>();
+        for (Player p : players.values()) {
+            if (p.getStatus() == PlayerStatus.IN_LOBBY && p.getLastCommandAt() < limit) {
+                idle.add(p);
+            }
+        }
+        return idle;
+    }
+
+    /**
      * Broadcasts a message to all players currently in the lobby (status {@code IN_LOBBY}),
      * optionally excluding one session (e.g., the sender).
      *
