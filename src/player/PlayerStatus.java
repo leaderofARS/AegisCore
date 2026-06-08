@@ -22,8 +22,12 @@ public enum PlayerStatus {
     IN_LOBBY,
     /** Player is waiting in the automatic matchmaking queue. */
     QUEUED,
+    /** Player has a pending room invitation. */
+    PENDING_INVITE,
     /** Player is inside a lobby room (WAITING or READY_CHECK state). */
     IN_ROOM,
+    /** Player is spectating a room game session. */
+    SPECTATING,
     /** Player's room has transitioned to IN_PROGRESS; game session is active. */
     IN_GAME
 }

@@ -28,6 +28,11 @@ public class Player {
     private volatile PlayerStatus status;
     private volatile String       currentRoomId;
 
+    private volatile long joinedAt = System.currentTimeMillis();
+    private volatile long lastCommandAt = System.currentTimeMillis();
+    private volatile int commandCount = 0;
+    private final java.util.Map<String, String> metadata = new java.util.concurrent.ConcurrentHashMap<>();
+
     /**
      * Constructs a new Player for the given session.
      *
@@ -80,4 +85,11 @@ public class Player {
      * @return non-null player label
      */
     public String getLabel() { return displayName != null ? displayName : sessionId; }
+
+    public long getJoinedAt() { return joinedAt; }
+    public long getLastCommandAt() { return lastCommandAt; }
+    public void setLastCommandAt(long timestamp) { this.lastCommandAt = timestamp; }
+    public int getCommandCount() { return commandCount; }
+    public synchronized void incrementCommandCount() { this.commandCount++; }
+    public java.util.Map<String, String> getMetadata() { return metadata; }
 }

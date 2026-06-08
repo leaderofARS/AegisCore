@@ -27,16 +27,35 @@ public class RoomRegistry {
     private final AtomicInteger                    roomCounter = new AtomicInteger(0);
 
     /**
-     * Creates a new room, assigns it a unique ID, and registers it.
+     * Creates a new room with default config, assigns it a unique ID, and registers it.
      *
      * @param name            display name for the room
      * @param ownerSessionId  session ID of the creating player
      * @param maxPlayers      maximum occupant count (2–32)
      * @return the newly created and registered {@link Room}
+     * @throws IllegalStateException if the room limit is reached
      */
     public Room createRoom(String name, String ownerSessionId, int maxPlayers) {
+        return createRoom(name, ownerSessionId, maxPlayers, RoomConfig.defaultConfig());
+    }
+
+    /**
+     * Creates a new room with a custom configuration, checking against the maximum rooms cap.
+     *
+     * @param name            display name for the room
+     * @param ownerSessionId  session ID of the creating player
+     * @param maxPlayers      maximum occupant count (2–32)
+     * @param config          room configuration parameters
+     * @return the newly created and registered {@link Room}
+     * @throws IllegalStateException if the room limit is reached
+     */
+    public Room createRoom(String name, String ownerSessionId, int maxPlayers, RoomConfig config) {
+        int maxRoomsLimit = admin.ServerConfig.getInstance().getMaxRooms();
+        if (getActiveRoomCount() >= maxRoomsLimit) {
+            throw new IllegalStateException("Server room limit reached (" + maxRoomsLimit + ")");
+        }
         String roomId = "r-" + String.format("%03d", roomCounter.incrementAndGet());
-        Room room = new Room(roomId, name, ownerSessionId, maxPlayers);
+        Room room = new Room(roomId, name, ownerSessionId, maxPlayers, config);
         rooms.put(roomId, room);
         Logger.logRegistry("Room created: " + roomId + " '" + name +
                            "' by " + ownerSessionId + " (max: " + maxPlayers + ")");
@@ -50,6 +69,28 @@ public class RoomRegistry {
      * @return the matching room, or {@code null}
      */
     public Room getRoom(String roomId) { return rooms.get(roomId); }
+
+    /**
+     * Returns rooms filtered by a game mode tag.
+     */
+    public List<Room> getRoomsByGameMode(String gameMode) {
+        if (gameMode == null) return java.util.Collections.emptyList();
+        return rooms.values().stream()
+            .filter(r -> r.getState() != RoomState.CLOSED)
+            .filter(r -> gameMode.equalsIgnoreCase(r.getConfig().gameMode()))
+            .collect(Collectors.toList());
+    }
+
+    /**
+     * Returns rooms matching a specific region.
+     */
+    public List<Room> getRoomsByRegion(String region) {
+        if (region == null) return java.util.Collections.emptyList();
+        return rooms.values().stream()
+            .filter(r -> r.getState() != RoomState.CLOSED)
+            .filter(r -> region.equalsIgnoreCase(r.getConfig().region()))
+            .collect(Collectors.toList());
+    }
 
     /**
      * Returns a list of rooms that are in {@code WAITING} state and not yet full.

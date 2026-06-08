@@ -4,6 +4,9 @@ import core.Logger;
 import player.Player;
 import player.PlayerRegistry;
 import protocol.CommandRouter;
+import network.ProtocolDetector;
+import network.WebSocketHandshake;
+import network.WebSocketFrame;
 
 import java.io.*;
 import java.net.*;
@@ -31,6 +34,7 @@ public class ClientHandler implements Runnable {
     private final CommandRouter   commandRouter;
 
     private PrintWriter output;
+    private volatile boolean     isWebSocket     = false;
 
     private volatile boolean     active          = false;
     private volatile boolean     forcedDisconnect = false;
@@ -47,7 +51,7 @@ public class ClientHandler implements Runnable {
      */
     public ClientHandler(Socket socket, PlayerRegistry playerRegistry, CommandRouter commandRouter) {
         this.socket         = socket;
-        this.sessionId      = socket.getRemoteSocketAddress().toString();
+        this.sessionId      = socket != null && socket.getRemoteSocketAddress() != null ? socket.getRemoteSocketAddress().toString() : "mock-session";
         this.playerRegistry = playerRegistry;
         this.commandRouter  = commandRouter;
     }
@@ -75,12 +79,24 @@ public class ClientHandler implements Runnable {
      */
     public synchronized void sendMessage(String message) {
         if (!active) { return; }
-        output.println(message);
-        if (output.checkError()) {
-            if (claimEvictionLog()) {
-                Logger.logClientHandlerError("[DEAD SOCKET] Write failed for " + sessionId + " — forcing disconnect.");
+        if (isWebSocket) {
+            try {
+                socket.getOutputStream().write(WebSocketFrame.encode(message));
+                socket.getOutputStream().flush();
+            } catch (IOException e) {
+                if (claimEvictionLog()) {
+                    Logger.logClientHandlerError("[DEAD SOCKET] Write failed for " + sessionId + " — forcing disconnect.");
+                }
+                forceDisconnect();
             }
-            forceDisconnect();
+        } else {
+            output.println(message);
+            if (output.checkError()) {
+                if (claimEvictionLog()) {
+                    Logger.logClientHandlerError("[DEAD SOCKET] Write failed for " + sessionId + " — forcing disconnect.");
+                }
+                forceDisconnect();
+            }
         }
     }
 
@@ -93,6 +109,14 @@ public class ClientHandler implements Runnable {
         if (!active) { return; }
         forcedDisconnect = true;
         active = false;
+        if (isWebSocket) {
+            try {
+                socket.getOutputStream().write(WebSocketFrame.encodeClose());
+                socket.getOutputStream().flush();
+            } catch (IOException e) {
+                // Ignore
+            }
+        }
         closeSocket();
     }
 
@@ -100,17 +124,28 @@ public class ClientHandler implements Runnable {
      * Read loop for this player's dedicated thread.
      *
      * <p>Initialises streams, creates and registers a {@link Player}, then blocks on
-     * {@link BufferedReader#readLine()} until the client disconnects or an error occurs.
+     * read until the client disconnects or an error occurs.
      * Every received line is forwarded to {@link CommandRouter#route}. Cleanup runs
      * unconditionally in the {@code finally} block.
      */
     @Override
     public void run() {
         try {
-            output = new PrintWriter(socket.getOutputStream(), true);
-            BufferedReader input = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            PushbackInputStream pbis = new PushbackInputStream(socket.getInputStream(), 4);
+            ProtocolDetector.Protocol proto = ProtocolDetector.detect(pbis);
+            isWebSocket = (proto == ProtocolDetector.Protocol.WEBSOCKET);
 
             synchronized (this) { active = true; }
+
+            if (isWebSocket) {
+                boolean handshakeSuccess = WebSocketHandshake.performHandshake(pbis, socket.getOutputStream());
+                if (!handshakeSuccess) {
+                    forceDisconnect();
+                    return;
+                }
+            } else {
+                output = new PrintWriter(socket.getOutputStream(), true);
+            }
 
             player = new Player(sessionId, this);
             playerRegistry.register(player);
@@ -118,10 +153,21 @@ public class ClientHandler implements Runnable {
             sendMessage("[SERVER] Connected to AegisCore Game Lobby Server.");
             sendMessage("[SERVER] Set your name to begin:  NAME <username>");
 
-            String line;
-            while ((line = input.readLine()) != null) {
-                commandRouter.route(player, line);
-                if (!active) { break; }
+            if (isWebSocket) {
+                while (active) {
+                    String line = WebSocketFrame.decode(pbis);
+                    if (line == null) {
+                        break;
+                    }
+                    commandRouter.route(player, line);
+                }
+            } else {
+                BufferedReader input = new BufferedReader(new InputStreamReader(pbis));
+                String line;
+                while ((line = input.readLine()) != null) {
+                    commandRouter.route(player, line);
+                    if (!active) { break; }
+                }
             }
 
             if (forcedDisconnect) {

@@ -8,6 +8,13 @@ import player.PlayerStatus;
 import room.Room;
 import room.RoomRegistry;
 import room.RoomState;
+import security.NameValidator;
+import security.RateLimiter;
+import security.InputSanitizer;
+import security.BanList;
+import social.InviteManager;
+import social.InviteResult;
+import social.WhisperRouter;
 
 import java.util.List;
 
@@ -71,16 +78,30 @@ public class CommandRouter {
      * @param rawInput the raw text line; may be blank but not {@code null}
      */
     public void route(Player player, String rawInput) {
-        if (rawInput == null || rawInput.isBlank()) { return; }
+        player.setLastCommandAt(System.currentTimeMillis());
+        player.incrementCommandCount();
 
-        String[]    tokens = rawInput.trim().split("\\s+");
+        if (!InputSanitizer.isValidLine(rawInput)) {
+            player.send("[ERROR] Input line too long (max 512 characters).");
+            return;
+        }
+
+        String sanitized = InputSanitizer.sanitize(rawInput);
+        if (sanitized.isEmpty()) { return; }
+
+        if (!RateLimiter.getInstance().allowRequest(player.getSessionId())) {
+            player.send("[ERROR] Rate limit exceeded. Please wait.");
+            return;
+        }
+
+        String[]    tokens = sanitized.split("\\s+");
         CommandType type   = CommandType.parse(tokens[0]);
         String[]    args   = tokens.length > 1
                              ? java.util.Arrays.copyOfRange(tokens, 1, tokens.length)
                              : new String[0];
 
         CommandContext ctx = new CommandContext(player, type, args);
-        Logger.logClientHandler("[CMD] " + player.getSessionId() + " → " + rawInput.trim());
+        Logger.logClientHandler("[CMD] " + player.getSessionId() + " -> " + tokens[0] + " (args: " + args.length + ")");
 
         if (player.getDisplayName() == null && type != CommandType.NAME && type != CommandType.QUIT) {
             player.send("[ERROR] You must set a name first.  Usage: NAME <username>");
@@ -103,9 +124,16 @@ public class CommandRouter {
             case QUEUE   -> handleQueue(ctx);
             case DEQUEUE -> handleDequeue(ctx);
             case CHAT    -> handleChat(ctx);
+            case WHISPER -> handleWhisper(ctx);
+            case INVITE  -> handleInvite(ctx);
+            case ACCEPT  -> handleAccept(ctx);
+            case DECLINE -> handleDecline(ctx);
+            case SPECTATE-> handleSpectate(ctx);
+            case ADMIN   -> handleAdmin(ctx);
+            case PONG    -> handlePong(ctx);
             case STATS   -> handleStats(ctx);
             case QUIT    -> handleQuit(ctx);
-            default      -> player.send("[ERROR] Unknown command. Valid: NAME CREATE JOIN LEAVE LIST READY UNREADY QUEUE DEQUEUE CHAT STATS QUIT");
+            default      -> player.send("[ERROR] Unknown command. Valid: NAME CREATE JOIN LEAVE LIST READY UNREADY QUEUE DEQUEUE CHAT WHISPER INVITE ACCEPT DECLINE SPECTATE STATS QUIT");
         }
     }
 
@@ -123,26 +151,46 @@ public class CommandRouter {
         if (roomId != null) {
             Room room = roomRegistry.getRoom(roomId);
             if (room != null) {
-                room.broadcast("[INFO] " + player.getLabel() + " lost their connection.");
-                room.removePlayer(player);
+                if (player.getStatus() == PlayerStatus.SPECTATING) {
+                    room.removeSpectator(player);
+                } else {
+                    room.broadcast("[INFO] " + player.getLabel() + " lost their connection.");
+                    room.removePlayer(player);
+                }
                 if (room.getState() == RoomState.CLOSED) {
                     roomRegistry.cleanupClosedRooms();
                 }
             }
         }
+        RateLimiter.getInstance().evict(player.getSessionId());
+        network.HeartbeatManager.getInstance().evict(player.getSessionId());
     }
 
     private void handleName(CommandContext ctx) {
         String name = ctx.arg(0);
-        if (name.length() < 2 || name.length() > 20) {
-            ctx.player.send("[ERROR] Username must be 2–20 characters.");
+        NameValidator.ValidationResult res = NameValidator.validate(name);
+        if (res instanceof NameValidator.ValidationResult.Invalid invalid) {
+            ctx.player.send("[ERROR] " + invalid.reason());
             return;
         }
-        ctx.player.setDisplayName(name);
+
+        String cleanName = ((NameValidator.ValidationResult.Valid) res).cleanName();
+
+        if (playerRegistry.getPlayerByName(cleanName) != null) {
+            ctx.player.send("[ERROR] The name \"" + cleanName + "\" is already taken.");
+            return;
+        }
+
+        if (BanList.getInstance().isNameBanned(cleanName)) {
+            ctx.player.send("[ERROR] The name \"" + cleanName + "\" is banned.");
+            return;
+        }
+
+        ctx.player.setDisplayName(cleanName);
         ctx.player.setStatus(PlayerStatus.IN_LOBBY);
-        ctx.player.send("[SERVER] Welcome to AegisCore, " + name + "!");
-        ctx.player.send("[SERVER] Commands: CREATE <name> [slots]  |  JOIN <id>  |  QUEUE  |  LIST  |  STATS");
-        Logger.logClientHandler("Player named: " + name + " [" + ctx.player.getSessionId() + "]");
+        ctx.player.send("[SERVER] Welcome to AegisCore, " + cleanName + "!");
+        ctx.player.send("[SERVER] Commands: CREATE <name> [slots]  |  JOIN <id>  |  QUEUE  |  LIST  |  STATS  |  WHISPER <name> <msg>");
+        Logger.logClientHandler("Player named: " + cleanName + " [" + ctx.player.getSessionId() + "]");
     }
 
     private void handleCreate(CommandContext ctx) {
@@ -164,11 +212,15 @@ public class CommandRouter {
                 return;
             }
         }
-        Room room = roomRegistry.createRoom(roomName, ctx.player.getSessionId(), maxPlayers);
-        room.addPlayer(ctx.player);
-        ctx.player.send("[SERVER] Room created: " + room.getRoomId() + " | \"" + roomName + "\" | " + maxPlayers + " slots");
-        ctx.player.send("[SERVER] Share this ID to invite others: " + room.getRoomId());
-        ctx.player.send("[SERVER] Type READY when you are prepared to start.");
+        try {
+            Room room = roomRegistry.createRoom(roomName, ctx.player.getSessionId(), maxPlayers);
+            room.addPlayer(ctx.player);
+            ctx.player.send("[SERVER] Room created: " + room.getRoomId() + " | \"" + roomName + "\" | " + maxPlayers + " slots");
+            ctx.player.send("[SERVER] Share this ID to invite others: " + room.getRoomId());
+            ctx.player.send("[SERVER] Type READY when you are prepared to start.");
+        } catch (IllegalStateException e) {
+            ctx.player.send("[ERROR] " + e.getMessage());
+        }
     }
 
     private void handleJoin(CommandContext ctx) {
@@ -204,8 +256,12 @@ public class CommandRouter {
         }
         Room room = roomRegistry.getRoom(roomId);
         if (room != null) {
-            room.broadcast("[INFO] " + ctx.player.getLabel() + " left the room.");
-            room.removePlayer(ctx.player);
+            if (ctx.player.getStatus() == PlayerStatus.SPECTATING) {
+                room.removeSpectator(ctx.player);
+            } else {
+                room.broadcast("[INFO] " + ctx.player.getLabel() + " left the room.");
+                room.removePlayer(ctx.player);
+            }
             if (room.getState() == RoomState.CLOSED) { roomRegistry.cleanupClosedRooms(); }
         }
         ctx.player.send("[SERVER] You left the room. You are back in the lobby.");
@@ -280,8 +336,145 @@ public class CommandRouter {
         }
         Room room = roomRegistry.getRoom(roomId);
         if (room != null) {
-            room.broadcast("[ROOM] " + ctx.player.getLabel() + ": " + ctx.joinArgs(0));
+            String msg = ctx.joinArgs(0);
+            room.recordChat(ctx.player, msg);
+            room.broadcast("[ROOM] " + ctx.player.getLabel() + ": " + msg);
         }
+    }
+
+    private void handleWhisper(CommandContext ctx) {
+        String targetName = ctx.arg(0);
+        String msg = ctx.joinArgs(1);
+        WhisperRouter.sendWhisper(ctx.player, targetName, msg);
+    }
+
+    private void handleInvite(CommandContext ctx) {
+        String targetName = ctx.arg(0);
+        Player invitee = playerRegistry.getPlayerByName(targetName);
+        if (invitee == null) {
+            ctx.player.send("[ERROR] Player not online: " + targetName);
+            return;
+        }
+        String roomId = ctx.player.getCurrentRoomId();
+        if (roomId == null) {
+            ctx.player.send("[ERROR] You must be in a room to invite others.");
+            return;
+        }
+        InviteManager.getInstance().issueInvite(ctx.player, invitee, roomId);
+        ctx.player.send("[SERVER] Invitation sent to " + targetName);
+    }
+
+    private void handleAccept(CommandContext ctx) {
+        String inviteId = ctx.arg(0);
+        InviteResult res = InviteManager.getInstance().accept(ctx.player, inviteId);
+        if (res instanceof InviteResult.Accepted accepted) {
+            Room room = roomRegistry.getRoom(accepted.invite().roomId());
+            if (room == null || room.getState() != RoomState.WAITING || room.isFull()) {
+                ctx.player.send("[ERROR] The room is no longer joinable.");
+                return;
+            }
+            room.addPlayer(ctx.player);
+            room.broadcast("[INFO] " + ctx.player.getLabel() + " joined the room. (" + room.getPlayerCount() + "/" + room.getMaxPlayers() + ")");
+            ctx.player.send("[SERVER] Joined room: " + room.getRoomId() + " | \"" + room.getName() + "\"");
+            ctx.player.send("[SERVER] Type READY when you are prepared to start.");
+        } else if (res instanceof InviteResult.AlreadyInRoom) {
+            ctx.player.send("[ERROR] You are already in a room.");
+        } else if (res instanceof InviteResult.Expired) {
+            ctx.player.send("[ERROR] This invitation has expired.");
+        } else {
+            ctx.player.send("[ERROR] Invitation not found.");
+        }
+    }
+
+    private void handleDecline(CommandContext ctx) {
+        String inviteId = ctx.arg(0);
+        InviteManager.getInstance().decline(ctx.player, inviteId);
+        ctx.player.send("[SERVER] Invitation declined.");
+    }
+
+    private void handleSpectate(CommandContext ctx) {
+        if (ctx.player.getStatus() != PlayerStatus.IN_LOBBY) {
+            ctx.player.send("[ERROR] You must be in the lobby to spectate.");
+            return;
+        }
+        String roomId = ctx.arg(0);
+        Room room = roomRegistry.getRoom(roomId);
+        if (room == null) {
+            ctx.player.send("[ERROR] Room not found: " + roomId);
+            return;
+        }
+        if (!room.getConfig().spectatorSlotsAllowed()) {
+            ctx.player.send("[ERROR] Spectating is disabled in this room.");
+            return;
+        }
+        if (room.addSpectator(ctx.player)) {
+            room.broadcast("[ROOM] " + ctx.player.getLabel() + " is now spectating.");
+            ctx.player.send("[SERVER] You are now spectating room: " + room.getRoomId());
+        } else {
+            ctx.player.send("[ERROR] Could not join as spectator.");
+        }
+    }
+
+    private void handleAdmin(CommandContext ctx) {
+        if (ctx.args.length < 2) {
+            ctx.player.send("[ERROR] Usage: ADMIN <password> <KICK|BAN_IP|BAN_NAME|UNBAN|LIST_PLAYERS|LIST_ROOMS> [args...]");
+            return;
+        }
+        String password = ctx.arg(0);
+        if (!admin.AdminAuthenticator.authenticate(password)) {
+            ctx.player.send("[ERROR] Invalid administrator password.");
+            return;
+        }
+        String adminCmd = ctx.arg(1).toUpperCase();
+        String result;
+        switch (adminCmd) {
+            case "KICK" -> {
+                if (ctx.args.length < 3) {
+                    ctx.player.send("[ERROR] Usage: ADMIN <password> KICK <player-name> [reason]");
+                    return;
+                }
+                String target = ctx.arg(2);
+                String reason = ctx.args.length >= 4 ? ctx.joinArgs(3) : "kicked by administrator";
+                result = admin.AdminCommands.kickPlayer(target, reason, playerRegistry, admin.AdminAuditLog.getInstance(), ctx.player.getLabel());
+            }
+            case "BAN_NAME" -> {
+                if (ctx.args.length < 3) {
+                    ctx.player.send("[ERROR] Usage: ADMIN <password> BAN_NAME <player-name> [reason]");
+                    return;
+                }
+                String target = ctx.arg(2);
+                String reason = ctx.args.length >= 4 ? ctx.joinArgs(3) : "banned by administrator";
+                result = admin.AdminCommands.banPlayerName(target, reason, null, BanList.getInstance(), playerRegistry, admin.AdminAuditLog.getInstance(), ctx.player.getLabel());
+            }
+            case "BAN_IP" -> {
+                if (ctx.args.length < 3) {
+                    ctx.player.send("[ERROR] Usage: ADMIN <password> BAN_IP <ip> [reason]");
+                    return;
+                }
+                String target = ctx.arg(2);
+                String reason = ctx.args.length >= 4 ? ctx.joinArgs(3) : "IP banned by administrator";
+                result = admin.AdminCommands.banIp(target, reason, null, BanList.getInstance(), playerRegistry, admin.AdminAuditLog.getInstance(), ctx.player.getLabel());
+            }
+            case "UNBAN" -> {
+                if (ctx.args.length < 3) {
+                    ctx.player.send("[ERROR] Usage: ADMIN <password> UNBAN <target>");
+                    return;
+                }
+                String target = ctx.arg(2);
+                result = admin.AdminCommands.unban(target, BanList.getInstance(), admin.AdminAuditLog.getInstance(), ctx.player.getLabel());
+            }
+            case "LIST_PLAYERS" -> result = admin.AdminCommands.listPlayers(playerRegistry);
+            case "LIST_ROOMS" -> result = admin.AdminCommands.listRooms(roomRegistry);
+            default -> {
+                ctx.player.send("[ERROR] Unknown admin command: " + adminCmd);
+                return;
+            }
+        }
+        ctx.player.send(result);
+    }
+
+    private void handlePong(CommandContext ctx) {
+        network.HeartbeatManager.getInstance().recordPong(ctx.player.getSessionId());
     }
 
     private void handleStats(CommandContext ctx) {
