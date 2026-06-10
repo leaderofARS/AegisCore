@@ -14,6 +14,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import server.Server;
+import player.PlayerRegistry;
+
 public class LoadTest {
     private static final String HOST = "localhost";
     private static final int PORT = 5000;
@@ -59,7 +62,7 @@ public class LoadTest {
         pool.shutdown();
         pool.awaitTermination(1, TimeUnit.MINUTES);
 
-        int finalRegistryCount = SharedClientRegistry.getInstance().getClientCount();
+        int finalRegistryCount = PlayerRegistry.getInstance().getPlayerCount();
 
         System.out.println("[LOADTEST] Completed.");
         System.out.println("[LOADTEST] Successful sessions: " + successfulSessions.get());

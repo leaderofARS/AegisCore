@@ -132,7 +132,7 @@ public class ClientHandler implements Runnable {
     public void run() {
         try {
             PushbackInputStream pbis = new PushbackInputStream(socket.getInputStream(), 4);
-            ProtocolDetector.Protocol proto = ProtocolDetector.detect(pbis);
+            ProtocolDetector.Protocol proto = ProtocolDetector.detect(socket, pbis);
             isWebSocket = (proto == ProtocolDetector.Protocol.WEBSOCKET);
 
             synchronized (this) { active = true; }

@@ -48,7 +48,7 @@ public class Server {
         // Parse --port command line arg to override default config
         for (int i = 0; i < args.length; i++) {
             if ("--port".equals(args[i]) && i + 1 < args.length) {
-                System.setProperty("port", args[i + 1]);
+                System.setProperty("aegiscore.port", args[i + 1]);
             }
         }
 
