@@ -72,6 +72,10 @@ public class Server {
         // Start heartbeat manager
         HeartbeatManager.getInstance().start();
 
+        // Start cluster manager
+        cluster.ClusterManager.getInstance().initialize(commandRouter);
+        cluster.ClusterManager.getInstance().start();
+
         // Initialize and start metrics server if enabled
         if (config.isMetricsEnabled()) {
             core.MetricsCollector.getInstance().initialize(playerRegistry, roomRegistry, matchmakingQueue);
@@ -157,6 +161,9 @@ public class Server {
         if (matchmakingThread != null) { matchmakingThread.interrupt(); }
 
         HeartbeatManager.getInstance().stop();
+
+        // Shut down cluster manager
+        cluster.ClusterManager.getInstance().stop();
 
         if (metricsServer != null) {
             metricsServer.stop();

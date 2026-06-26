@@ -21,6 +21,11 @@ public final class WhisperRouter {
     public static boolean sendWhisper(Player sender, String targetName, String message) {
         Player recipient = PlayerRegistry.getInstance().getPlayerByName(targetName);
         if (recipient == null) {
+            if (cluster.ClusterConfig.getInstance().isEnabled() &&
+                cluster.ClusterManager.getInstance().routeWhisper(targetName, sender.getDisplayName(), message)) {
+                sender.send(String.format("[WHISPER] To %s: %s", targetName, message));
+                return true;
+            }
             sender.send("[ERROR] Player not online: " + targetName);
             return false;
         }

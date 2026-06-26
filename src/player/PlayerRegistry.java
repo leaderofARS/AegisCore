@@ -37,6 +37,7 @@ public class PlayerRegistry {
         long total = totalConnections.incrementAndGet();
         Logger.logRegistry("Player registered: " + player.getSessionId() +
                            " | Active: " + players.size() + " | Total ever: " + total);
+        cluster.ClusterManager.getInstance().syncLocalPlayer(player);
     }
 
     /**
@@ -45,7 +46,10 @@ public class PlayerRegistry {
      * @param sessionId the session ID used at registration time
      */
     public void deregister(String sessionId) {
-        players.remove(sessionId);
+        Player player = players.remove(sessionId);
+        if (player != null) {
+            cluster.ClusterManager.getInstance().syncPlayerLeave(player);
+        }
         Logger.logRegistry("Player deregistered: " + sessionId + " | Active: " + players.size());
     }
 
