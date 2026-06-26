@@ -100,6 +100,15 @@ public class CommandRouter {
                              ? java.util.Arrays.copyOfRange(tokens, 1, tokens.length)
                              : new String[0];
 
+        // If the player is in a remote cluster room, forward all room commands to the remote node
+        String roomId = player.getCurrentRoomId();
+        if (roomId != null && cluster.ClusterConfig.getInstance().isEnabled() 
+                && cluster.ClusterManager.getInstance().isRemoteRoom(roomId) 
+                && type != CommandType.QUIT && type != CommandType.WHISPER) {
+            cluster.ClusterManager.getInstance().forwardCommand(player, roomId, rawInput);
+            return;
+        }
+
         CommandContext ctx = new CommandContext(player, type, args);
         Logger.logClientHandler("[CMD] " + player.getSessionId() + " -> " + tokens[0] + " (args: " + args.length + ")");
 
@@ -231,6 +240,11 @@ public class CommandRouter {
         String roomId = ctx.arg(0);
         Room   room   = roomRegistry.getRoom(roomId);
         if (room == null) {
+            if (cluster.ClusterConfig.getInstance().isEnabled() && 
+                cluster.ClusterManager.getInstance().isRemoteRoom(roomId)) {
+                cluster.ClusterManager.getInstance().requestJoinRemoteRoom(ctx.player, roomId);
+                return;
+            }
             ctx.player.send("[ERROR] Room not found: " + roomId);
             return;
         }
@@ -269,7 +283,8 @@ public class CommandRouter {
 
     private void handleList(CommandContext ctx) {
         List<Room> open = roomRegistry.getOpenRooms();
-        if (open.isEmpty()) {
+        List<cluster.ClusterManager.RemoteRoomInfo> remotes = cluster.ClusterManager.getInstance().getRemoteRooms();
+        if (open.isEmpty() && remotes.isEmpty()) {
             ctx.player.send("[SERVER] No open rooms. Create one with: CREATE <name> [slots]");
             return;
         }
@@ -277,6 +292,12 @@ public class CommandRouter {
         ctx.player.send(String.format("[SERVER]   %-8s %-20s %-8s %s", "ID", "Name", "Players", "Status"));
         for (Room r : open) {
             ctx.player.send("[SERVER]   " + r.getSnapshot());
+        }
+        for (cluster.ClusterManager.RemoteRoomInfo r : remotes) {
+            if (r.state() == RoomState.WAITING) {
+                ctx.player.send(String.format("[SERVER]   %-8s %-20s %-8s %s (Node: %s)", 
+                    r.roomId(), r.name(), "0/" + r.maxPlayers(), r.state(), r.nodeId()));
+            }
         }
         ctx.player.send("[SERVER] =================================================");
     }

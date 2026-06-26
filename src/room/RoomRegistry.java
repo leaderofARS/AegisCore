@@ -59,6 +59,7 @@ public class RoomRegistry {
         rooms.put(roomId, room);
         Logger.logRegistry("Room created: " + roomId + " '" + name +
                            "' by " + ownerSessionId + " (max: " + maxPlayers + ")");
+        cluster.ClusterManager.getInstance().syncLocalRoom(room);
         return room;
     }
 
@@ -119,6 +120,11 @@ public class RoomRegistry {
      * Called after a room close event to keep the map from growing indefinitely.
      */
     public void cleanupClosedRooms() {
+        rooms.forEach((id, room) -> {
+            if (room.getState() == RoomState.CLOSED) {
+                cluster.ClusterManager.getInstance().destroyLocalRoom(id);
+            }
+        });
         rooms.entrySet().removeIf(e -> e.getValue().getState() == RoomState.CLOSED);
     }
 }
